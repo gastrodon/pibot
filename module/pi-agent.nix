@@ -190,9 +190,8 @@ let
     # Linear sends promptContext: "" (present but empty) for sessions started
     # without a triggering comment, e.g. agentSessionCreateOnIssue against a
     # freshly-created issue. Undetected, that sent pi a blank prompt: it settled
-    # immediately with no text response and did none of the requested work
-    # (observed on all of EVA-136..150). `useful` treats "" the same as null so
-    # the fallback chain actually runs.
+    # immediately with no text response and did none of the requested work.
+    # `useful` treats "" the same as null so the fallback chain actually runs.
     prompt=$(jq -r '
       def useful: if . == null then null elif (type == "string" and length == 0) then null else . end;
       (.promptContext | useful) // (.agentSession.promptContext | useful) // tojson
