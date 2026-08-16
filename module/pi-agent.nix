@@ -122,7 +122,7 @@ let
       git config --global user.email pibot@users.noreply.github.com
     fi
 
-    # Nomad handle for the worker itself (EVA-127): NOMAD_TOKEN rides in on a ro
+    # Nomad handle for the worker itself: NOMAD_TOKEN rides in on a ro
     # bind-mount of the same sops secret nomad-acl-bootstrap/pi-agent-register use
     # on the host (nomadBootstrapTokenFile). SECURITY: this is the cluster's full
     # ACL *management* token, not a scoped read-only one — deliberately reused as
@@ -330,8 +330,8 @@ in
         Path to a file containing the Nomad ACL management token. Used by the
         register unit to upsert the job, and bind-mounted (ro) into every
         dispatched task as NOMAD_TOKEN so the worker itself can query/dispatch
-        against the cluster (EVA-127) — the same management-scoped token, not
-        a narrower one.
+        against the cluster — the same management-scoped token, not a
+        narrower one.
       '';
     };
   };
