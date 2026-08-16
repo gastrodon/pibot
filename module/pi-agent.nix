@@ -32,6 +32,26 @@ let
     packages = [ "git:github.com/paoloanzn/pi-black@v0.84.1-cc2.1.224.4" ];
   };
 
+  # Opt-in models.json for a local Ollama provider, alongside settingsFile. Only
+  # generated when services.piAgent.ollama.enable is set with at least one model,
+  # so the default (Anthropic-only, via pi-black) is unaffected. Shape matches
+  # what pi expects for an OpenAI-completions-compatible provider: compat flags
+  # turn off features Ollama's endpoint doesn't support.
+  modelsFile = jsonFormat.generate "pi-models.json" {
+    providers = {
+      ollama = {
+        baseUrl = cfg.ollama.baseUrl;
+        api = "openai-completions";
+        apiKey = "ollama";
+        compat = {
+          supportsDeveloperRole = false;
+          supportsReasoningEffort = false;
+        };
+        models = cfg.ollama.models;
+      };
+    };
+  };
+
   # Unpatched standalone pi. It's a Bun single-exec (glibc-dynamic) — we do NOT
   # autoPatchelf it (patchelf-on-appended-payload breaks Bun single-execs). The
   # interp is the FHS path /lib64/ld-linux-x86-64.so.2; piImage carries glibc,
@@ -52,6 +72,9 @@ let
       mkdir -p $out
       cp -r . $out/
       cp ${settingsFile} $out/settings.json
+      ${lib.optionalString (cfg.ollama.enable && cfg.ollama.models != [ ]) ''
+        cp ${modelsFile} $out/models.json
+      ''}
       cp ${entrypointScript} $out/entrypoint.sh
     '';
   };
@@ -99,6 +122,9 @@ let
     export HOME=/root
     mkdir -p "$HOME/.pi/agent"
     cp -f /opt/pi/settings.json "$HOME/.pi/agent/settings.json"
+    if [ -f /opt/pi/models.json ]; then
+      cp -f /opt/pi/models.json "$HOME/.pi/agent/models.json"
+    fi
 
     # GitHub auth for clone/push. The PAT rides in on a ro bind-mount of the sops
     # secret; feed it to git via a credential helper (keeps it out of .gitconfig)
@@ -225,6 +251,22 @@ in
     nomadBootstrapTokenFile = lib.mkOption {
       type = lib.types.path;
       description = "Path to a file containing the Nomad ACL management token, used to register the job.";
+    };
+
+    ollama = {
+      enable = lib.mkEnableOption "a local Ollama provider stanza in ~/.pi/agent/models.json, for --model ollama/<id> dispatches";
+
+      baseUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "http://ollama:11434/v1";
+        description = "OpenAI-completions-compatible base URL of the Ollama endpoint, reachable from the container network.";
+      };
+
+      models = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Model ids pulled on the Ollama endpoint to expose under the ollama/ provider prefix. models.json is only generated when this is non-empty.";
+      };
     };
   };
 

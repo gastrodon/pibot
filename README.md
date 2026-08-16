@@ -65,3 +65,21 @@ Add this flake as an input and import the modules you need:
 `services.piAgent` expects a Nomad client with `meta.pi_worker = "true"` (see
 the `pi_worker` constraint in `module/pi-agent.nix`) and a persistent
 `/var/lib/pi-agent/home` volume for `pi`'s auth state.
+
+By default the worker routes to Anthropic (`claude-sonnet-5`, high thinking)
+via `pi-black`. To also route requests at a local Ollama endpoint, set
+`services.piAgent.ollama`:
+
+```nix
+services.piAgent.ollama = {
+  enable = true;
+  baseUrl = "http://ollama.example:11434/v1";
+  models = [ "qwen2.5-coder:7b" ];
+};
+```
+
+This bakes a `models.json` (`api = "openai-completions"`, `apiKey = "ollama"`,
+developer-role and reasoning-effort compat both off) alongside `settings.json`,
+copied onto the persistent volume every dispatch. Once enabled, the worker's
+existing per-request `--model provider/id` override resolves `ollama/<id>`
+with no further changes.
