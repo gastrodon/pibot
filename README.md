@@ -15,8 +15,11 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   a systemd service.
 - **`module/pi-agent.nix`** — NixOS module: the parameterized Nomad job spec
   (`pi-agent`) the receiver dispatches per session, plus the Nix-built runtime
-  image and entrypoint that runs `pi` headlessly and posts its output back to
-  Linear.
+  image and entrypoint that runs `pi` headlessly (RPC mode, to agent_end) and
+  posts its output back to Linear.
+- **`module/pi-agent-system-prompt.md`** — the worker's operating manual, baked
+  into the runtime image and passed as `--append-system-prompt`. Linear's
+  workspace/team agent guidance is appended per-dispatch.
 
 ## Secrets
 
