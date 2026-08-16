@@ -17,10 +17,15 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          linear-agent = import ./default.nix { inherit pkgs; inherit (pkgs) lib; };
+          linear-agent = import ./default.nix {
+            inherit pkgs;
+            inherit (pkgs) lib;
+          };
           default = self.packages.${system}.linear-agent;
         }
       );
+
+      formatter = nixpkgs.lib.genAttrs systems (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
 
       # linearAgent: the webhook receiver systemd service.
       # piAgent: the parameterized Nomad batch job + isolated pi worker it dispatches.
