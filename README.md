@@ -67,14 +67,21 @@ the `pi_worker` constraint in `module/pi-agent.nix`) and a persistent
 `/var/lib/pi-agent/home` volume for `pi`'s auth state.
 
 By default the worker routes to Anthropic (`claude-sonnet-5`, high thinking)
-via `pi-black`. To also route requests at a local Ollama endpoint, set
-`services.piAgent.ollama`:
+via `pi-black`. To route it at a local Ollama endpoint instead, declare the
+provider *and* point the fleet defaults at it:
 
 ```nix
-services.piAgent.ollama = {
-  enable = true;
-  baseUrl = "http://ollama.example:11434/v1";
+services.piAgent = {
+  ollama = {
+    enable = true;
+    baseUrl = "http://ollama.example:11434/v1";
+    model = "qwen2.5-coder:7b";
+  };
+
+  # what every dispatch actually runs
+  provider = "ollama";
   model = "qwen2.5-coder:7b";
+  thinkingLevel = "off";
 };
 ```
 
@@ -85,9 +92,15 @@ if `ollama.enable` is later flipped off, so a stale file never points at a
 dead endpoint). An ollama-routed worker runs exactly one model, hence a single
 required `model` rather than a list.
 
-**Not wired up end to end yet:** the entrypoint's `--model` override reads
-`NOMAD_META_model`, but `linear-agent`'s `dispatchNomad` (`main.go`) only ever
-sends `session_id`, `action`, and `access_token` as dispatch Meta — it doesn't
-send `model`. So today, no Linear-originated session can reach `ollama/<id>`;
-only a manual `nomad job dispatch -meta model=ollama/<id> pi-agent` can. Wiring
-per-session model selection through the receiver is separate follow-up work.
+`provider`/`model`/`thinkingLevel` are the lever that actually routes traffic,
+and they are **fleet-wide**: every dispatch moves together. The entrypoint does
+honour a per-request `--model` from `NOMAD_META_model`, but `linear-agent`'s
+`dispatchNomad` (`main.go`) only ever sends `session_id`, `action`, and
+`access_token` as dispatch Meta — never `model`. So a Linear-originated session
+cannot pick its own model; only a manual
+`nomad job dispatch -meta model=ollama/<id> pi-agent` can. Mixing providers per
+request is separate receiver work (EVA-111).
+
+Note that a default model configured on the Ollama server itself has no effect
+here: pi's OpenAI-completions requests always name a model explicitly, so the
+choice has to come from `settings.json`.

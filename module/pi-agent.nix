@@ -22,12 +22,17 @@ let
   # settings.json for the pi agent. Nix is authoritative — the entrypoint copies
   # this over the volume copy every dispatch, so Eva's tweaks flow through
   # rebuilds. defaultProjectTrust=always is required because -p is non-interactive
-  # (no trust prompt) and pi-black is loaded as a package. Model ID is a best
-  # guess — verify the real sonnet-5 catalog id with `pi update --models`.
+  # (no trust prompt) and pi-black is loaded as a package.
+  #
+  # These defaults are what every dispatch actually runs: the receiver
+  # (linear-agent's dispatchNomad) sends no `model` Meta, so the entrypoint's
+  # --model/--thinking overrides are unset for Linear-originated sessions and pi
+  # falls back to settings.json. Routing the fleet at the ollama provider below
+  # is therefore a settings change, not a receiver change.
   settingsFile = jsonFormat.generate "pi-settings.json" {
-    defaultProvider = "anthropic";
-    defaultModel = "claude-sonnet-5";
-    defaultThinkingLevel = "high";
+    defaultProvider = cfg.provider;
+    defaultModel = cfg.model;
+    defaultThinkingLevel = cfg.thinkingLevel;
     defaultProjectTrust = "always";
     packages = [ "git:github.com/paoloanzn/pi-black@v0.84.1-cc2.1.224.4" ];
   };
@@ -261,6 +266,48 @@ in
       description = "Path to a file containing the Nomad ACL management token, used to register the job.";
     };
 
+    provider = lib.mkOption {
+      type = lib.types.str;
+      default = "anthropic";
+      description = ''
+        Provider every dispatched session routes to, written to settings.json as
+        defaultProvider. "anthropic" (via pi-black, on the subscription) by
+        default; set to "ollama" — together with ollama.enable — to route the
+        whole fleet at the local endpoint. This is fleet-wide; per-session
+        routing needs the receiver to send a `model` dispatch Meta, which it
+        does not do yet.
+      '';
+    };
+
+    model = lib.mkOption {
+      type = lib.types.str;
+      default = "claude-sonnet-5";
+      description = ''
+        Model id every dispatched session runs, written to settings.json as
+        defaultModel. Must be a model the configured provider exposes: a catalog
+        id for a built-in provider (verify with `pi update --models`), or
+        ollama.model when provider = "ollama".
+      '';
+    };
+
+    thinkingLevel = lib.mkOption {
+      type = lib.types.enum [
+        "off"
+        "minimal"
+        "low"
+        "medium"
+        "high"
+        "xhigh"
+        "max"
+      ];
+      default = "high";
+      description = ''
+        Thinking level written to settings.json as defaultThinkingLevel. Ollama
+        generally wants "off" — most local models don't support reasoning, and
+        compat.supportsReasoningEffort is disabled for the ollama provider.
+      '';
+    };
+
     ollama = {
       enable = lib.mkEnableOption "a local Ollama provider stanza in ~/.pi/agent/models.json, for --model ollama/<id> dispatches";
 
@@ -278,7 +325,28 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # Persistent rw home for the pi container: auth.json, pi-black install, trust,
+    # Routing at ollama without generating models.json leaves pi with a provider
+    # it has never heard of: the model fails to resolve and every dispatch dies
+    # with `Model "ollama/<id>" not found`. Catch it at eval instead.
+    assertions = [
+      {
+        assertion = cfg.provider == "ollama" -> cfg.ollama.enable;
+        message = ''
+          services.piAgent.provider = "ollama" requires services.piAgent.ollama.enable = true,
+          otherwise no models.json is generated and the model cannot resolve.
+        '';
+      }
+      {
+        assertion = (cfg.provider == "ollama" && cfg.ollama.enable) -> (cfg.model == cfg.ollama.model);
+        message = ''
+          services.piAgent.model ("${cfg.model}") must match services.piAgent.ollama.model
+          ("${cfg.ollama.model}") when routing at ollama — models.json declares exactly one
+          model, and settings.json must name that one.
+        '';
+      }
+    ];
+
+    # Persistent rw container home: auth.json, pi-black install, trust,
     # sessions. Survives dispatches; the login command seeds auth.json here once.
     systemd.tmpfiles.rules = [
       "d /var/lib/pi-agent/home 0700 root root -"
