@@ -82,6 +82,7 @@ let
       pkgs.coreutils
       pkgs.cacert
       pkgs.glibc
+      pkgs.nomad
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -119,6 +120,18 @@ let
       git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
       git config --global user.name pibot
       git config --global user.email pibot@users.noreply.github.com
+    fi
+
+    # Nomad handle for the worker itself (EVA-127): NOMAD_TOKEN rides in on a ro
+    # bind-mount of the same sops secret nomad-acl-bootstrap/pi-agent-register use
+    # on the host (nomadBootstrapTokenFile). SECURITY: this is the cluster's full
+    # ACL *management* token, not a scoped read-only one — deliberately reused as
+    # the cheapest way to give pibot a handle at all; narrow it to a dedicated
+    # policy/token once we know what pibot actually calls. `nomad` (baked into
+    # the image) reads NOMAD_TOKEN/NOMAD_ADDR natively, no CLI flags needed.
+    if [ -f /run/nomad-token ]; then
+      NOMAD_TOKEN="$(tr -d '[:space:]' < /run/nomad-token)"
+      export NOMAD_TOKEN
     fi
 
     # Linear access for pi, as the pibot APP identity (never Eva's personal key).
@@ -277,7 +290,16 @@ $guidance"
                   "${piPkg}:/opt/pi:ro"
                   "/var/lib/pi-agent/home:/root/.pi/agent"
                   "${cfg.githubPatFile}:/run/github-pat:ro"
+                  "${cfg.nomadBootstrapTokenFile}:/run/nomad-token:ro"
                 ];
+              };
+              # NOMAD_ADDR resolves per-allocation to the node the task actually landed
+              # on (Nomad env interpolation, not Nix — hence the escaped \${}). The
+              # server boxes bind Nomad's HTTP API to 0.0.0.0:4646, but the podman
+              # task's network namespace can't reach the host's *loopback* — its LAN
+              # IP works because the podman bridge routes there.
+              Env = {
+                NOMAD_ADDR = "http://\${attr.unique.network.ip-address}:4646";
               };
               Resources = {
                 CPU = 1000;
@@ -304,7 +326,13 @@ in
 
     nomadBootstrapTokenFile = lib.mkOption {
       type = lib.types.path;
-      description = "Path to a file containing the Nomad ACL management token, used to register the job.";
+      description = ''
+        Path to a file containing the Nomad ACL management token. Used by the
+        register unit to upsert the job, and bind-mounted (ro) into every
+        dispatched task as NOMAD_TOKEN so the worker itself can query/dispatch
+        against the cluster (EVA-127) — the same management-scoped token, not
+        a narrower one.
+      '';
     };
   };
 
