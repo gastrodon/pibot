@@ -37,15 +37,17 @@ const (
 )
 
 type config struct {
-	listenAddr    string
-	webhookSecret []byte
-	refreshToken  string
-	clientID      string
-	clientSecret  string
-	stateDir      string
-	nomadAddr     string
-	nomadToken    string
-	nomadJob      string
+	listenAddr      string
+	webhookSecret   []byte
+	refreshToken    string
+	clientID        string
+	clientSecret    string
+	stateDir        string
+	nomadAddr       string
+	nomadToken      string
+	nomadJob        string
+	defaultModel    string
+	defaultThinking string
 }
 
 func loadConfig() config {
@@ -82,6 +84,16 @@ func loadConfig() config {
 		nomadAddr:     get("NOMAD_ADDR", "http://127.0.0.1:4646"),
 		nomadToken:    secretOrFile("NOMAD_TOKEN"),
 		nomadJob:      get("NOMAD_JOB", "pi-agent"),
+		// Migration step (EVA-111): the model/thinking default used to live solely
+		// in pi-agent's settings.json (baked in by Nix, requiring a rebuild to
+		// change). It now flows through dispatch Meta instead — same default
+		// value, but a surface the receiver can override per-request later
+		// without touching settings.json. settings.json's defaultProvider/
+		// defaultModel/defaultThinkingLevel remain only as the fallback for
+		// dispatches that carry no Meta at all (e.g. a manual `nomad job
+		// dispatch`).
+		defaultModel:    get("DEFAULT_MODEL", "anthropic/claude-sonnet-5"),
+		defaultThinking: get("DEFAULT_THINKING", "high"),
 	}
 }
 
@@ -400,6 +412,12 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []
 			"session_id":   ev.AgentSession.ID,
 			"action":       ev.Action,
 			"access_token": token,
+			// Every dispatch now carries an explicit model/thinking selection —
+			// currently always the configured default (DEFAULT_MODEL/
+			// DEFAULT_THINKING), since nothing yet derives a per-request override
+			// from the triggering event. That's the remaining piece of EVA-111.
+			"model":    c.cfg.defaultModel,
+			"thinking": c.cfg.defaultThinking,
 		},
 	}
 	buf, _ := json.Marshal(body)

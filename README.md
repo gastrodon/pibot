@@ -104,14 +104,19 @@ dead endpoint). An ollama-routed worker runs exactly one model, hence a single
 required `model` rather than a list.
 
 `provider`/`model`/`thinkingLevel` are the lever that actually routes traffic,
-and they are **fleet-wide**: every dispatch moves together. The entrypoint does
-honour a per-request `--model` from `NOMAD_META_model`, but `linear-agent`'s
-`dispatchNomad` (`main.go`) only ever sends `session_id`, `action`, and
-`access_token` as dispatch Meta — never `model`. So a Linear-originated session
-cannot pick its own model; only a manual
-`nomad job dispatch -meta model=ollama/<id> pi-agent` can. Mixing providers per
-request is separate receiver work (EVA-111).
+and they are **fleet-wide**: every dispatch moves together. The entrypoint
+honours a per-request `--model`/`--thinking` from `NOMAD_META_model`/
+`NOMAD_META_thinking`, and `linear-agent`'s `dispatchNomad` (`main.go`) now
+always sends both as dispatch Meta — defaulting to `DEFAULT_MODEL`/
+`DEFAULT_THINKING` (`services.linearAgent.defaultModel`/`defaultThinking`),
+which should match the fleet default above. `settings.json`'s
+`defaultProvider`/`defaultModel`/`defaultThinkingLevel` now only matter as a
+fallback for dispatches with no Meta at all (e.g. a manual `nomad job dispatch`
+with `model`/`thinking` omitted). A Linear-originated session still cannot pick
+its *own* model per request yet — every dispatch gets the same configured
+default; per-request override syntax is separate receiver work (EVA-111).
 
 Note that a default model configured on the Ollama server itself has no effect
 here: pi's OpenAI-completions requests always name a model explicitly, so the
-choice has to come from `settings.json`.
+choice has to come from the `model` dispatch Meta (or, absent that,
+`settings.json`).

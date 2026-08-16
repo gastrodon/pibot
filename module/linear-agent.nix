@@ -59,6 +59,35 @@ in
       default = null;
       description = "Path to a file containing the Nomad ACL token used to dispatch jobs, if ACLs are enabled.";
     };
+
+    defaultModel = lib.mkOption {
+      type = lib.types.str;
+      default = "anthropic/claude-sonnet-5";
+      description = ''
+        `provider/id` sent as the `model` dispatch Meta on every session
+        (pi's --model form), until per-request routing (EVA-111) can pick a
+        different value per dispatch. Keep in sync with
+        services.piAgent.provider + services.piAgent.model, which settings.json
+        falls back to only when a dispatch carries no `model` Meta at all.
+      '';
+    };
+
+    defaultThinking = lib.mkOption {
+      type = lib.types.enum [
+        "off"
+        "minimal"
+        "low"
+        "medium"
+        "high"
+        "xhigh"
+        "max"
+      ];
+      default = "high";
+      description = ''
+        Thinking level sent as the `thinking` dispatch Meta on every session.
+        Keep in sync with services.piAgent.thinkingLevel.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -83,6 +112,8 @@ in
         LINEAR_REFRESH_TOKEN_FILE = cfg.refreshTokenFile;
         LINEAR_CLIENT_ID_FILE = cfg.clientIdFile;
         LINEAR_CLIENT_SECRET_FILE = cfg.clientSecretFile;
+        DEFAULT_MODEL = cfg.defaultModel;
+        DEFAULT_THINKING = cfg.defaultThinking;
       }
       // lib.optionalAttrs (cfg.nomadTokenFile != null) {
         NOMAD_TOKEN_FILE = cfg.nomadTokenFile;
