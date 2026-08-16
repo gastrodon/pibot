@@ -185,7 +185,18 @@ let
     # (Go passes the payload through unparsed) — try promptContext, then the
     # nested form, then fall back to the whole payload so we never send empty.
     # jq -r prints a string bare and an object as compact JSON; .a.b is null-safe.
-    prompt=$(jq -r '.promptContext // .agentSession.promptContext // tojson' /local/webhook.json)
+    #
+    # jq's // only falls through on null/false, NOT on an empty string — and
+    # Linear sends promptContext: "" (present but empty) for sessions started
+    # without a triggering comment, e.g. agentSessionCreateOnIssue against a
+    # freshly-created issue. Undetected, that sent pi a blank prompt: it settled
+    # immediately with no text response and did none of the requested work
+    # (observed on all of EVA-136..150). `useful` treats "" the same as null so
+    # the fallback chain actually runs.
+    prompt=$(jq -r '
+      def useful: if . == null then null elif (type == "string" and length == 0) then null else . end;
+      (.promptContext | useful) // (.agentSession.promptContext | useful) // tojson
+    ' /local/webhook.json)
 
     model_args=""
     if [ -n "''${NOMAD_META_model:-}" ]; then model_args="--model ''${NOMAD_META_model}"; fi
