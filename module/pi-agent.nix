@@ -94,9 +94,11 @@ let
   # pi-black's git: install), nodejs (pi-black's install shells `npm install`),
   # curl (Linear post), jq (JSON build), gh (PR creation, reads GH_TOKEN), grep +
   # findutils (pi's bash tool reflexively shells `find … | grep …` to explore —
-  # coreutils supplies neither), bash, coreutils, cacert. nix lets pibot
-  # build/test gastrodon/dotfiles the same way CI does — `nix build
-  # .#nixosConfigurations.<host>.config.system.build.toplevel --impure` and
+  # coreutils supplies neither), bash, coreutils, cacert, go (pibot's own repo,
+  # gastrodon/pibot, is a Go module — `go build`/`go test`/`go vet` need the
+  # toolchain on PATH the same as any other language pibot is dispatched to work
+  # in). nix lets pibot build/test gastrodon/dotfiles the same way CI does — `nix
+  # build .#nixosConfigurations.<host>.config.system.build.toplevel --impure` and
   # `nix flake check`/`nixfmt --check`. sandbox is disabled: the podman task runs
   # unprivileged and can't create the user/mount namespaces a sandboxed nix build
   # needs; build-users-group is left unset so nix builds directly as the container's
@@ -121,6 +123,7 @@ let
       pkgs.cacert
       pkgs.glibc
       pkgs.nix
+      pkgs.go
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
