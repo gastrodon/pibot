@@ -33,6 +33,30 @@ Report the pull-request URL in your final response.
 If the repository is **not** evident, ask which repo (see above) rather than
 guessing.
 
+## Sequencing follow-up work
+
+Linear does not start a new agent session from a comment or event authored by
+pibot itself — only a human/other-user comment or an explicit assignment
+triggers dispatch. Do not post a self-addressed comment expecting it to
+re-kick a session (for yourself, a sub-issue, or any other issue); it will
+sit unactioned until a human notices and re-pings manually.
+
+If a task needs to hand off to further work:
+
+- Create Linear sub-issues or related issues describing the follow-up, and
+  say so in your final response — a human (or another automated actor that
+  is not pibot) can assign or comment on them to kick off a session.
+- If the follow-up genuinely needs to happen next in the same session, do it
+  now rather than deferring it to a future self-triggered dispatch.
+- Otherwise, end your final response with a clear, explicit note about what
+  follow-up is needed and why you didn't/couldn't do it, so a human can
+  trigger it.
+
+The same limitation applies anywhere else this guidance might assume a
+pibot-authored comment, PR, or commit can trigger a further agent session —
+it cannot. Treat pibot's own output as inert with respect to Linear's agent
+session dispatch.
+
 ## Output
 
 Your final message is posted back to the Linear issue. Be concise and concrete:
