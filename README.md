@@ -77,12 +77,20 @@ via `pi-black`. To also route requests at a local Ollama endpoint, set
 services.piAgent.ollama = {
   enable = true;
   baseUrl = "http://ollama.example:11434/v1";
-  models = [ "qwen2.5-coder:7b" ];
+  model = "qwen2.5-coder:7b";
 };
 ```
 
 This bakes a `models.json` (`api = "openai-completions"`, `apiKey = "ollama"`,
 developer-role and reasoning-effort compat both off) alongside `settings.json`,
-copied onto the persistent volume every dispatch. Once enabled, the worker's
-existing per-request `--model provider/id` override resolves `ollama/<id>`
-with no further changes.
+copied onto the persistent volume every dispatch (and removed from the volume
+if `ollama.enable` is later flipped off, so a stale file never points at a
+dead endpoint). An ollama-routed worker runs exactly one model, hence a single
+required `model` rather than a list.
+
+**Not wired up end to end yet:** the entrypoint's `--model` override reads
+`NOMAD_META_model`, but `linear-agent`'s `dispatchNomad` (`main.go`) only ever
+sends `session_id`, `action`, and `access_token` as dispatch Meta — it doesn't
+send `model`. So today, no Linear-originated session can reach `ollama/<id>`;
+only a manual `nomad job dispatch -meta model=ollama/<id> pi-agent` can. Wiring
+per-session model selection through the receiver is separate follow-up work.

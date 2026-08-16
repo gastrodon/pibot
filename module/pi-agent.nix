@@ -33,10 +33,12 @@ let
   };
 
   # Opt-in models.json for a local Ollama provider, alongside settingsFile. Only
-  # generated when services.piAgent.ollama.enable is set with at least one model,
-  # so the default (Anthropic-only, via pi-black) is unaffected. Shape matches
-  # what pi expects for an OpenAI-completions-compatible provider: compat flags
-  # turn off features Ollama's endpoint doesn't support.
+  # generated when services.piAgent.ollama.enable is set, so the default
+  # (Anthropic-only, via pi-black) is unaffected. Shape matches what pi expects
+  # for an OpenAI-completions-compatible provider: compat flags turn off
+  # features Ollama's endpoint doesn't support. pi's models.json schema wants
+  # `models` as a list of objects ({id: ...}), not bare strings — verified
+  # against the real pi 0.84.1 binary (`pi --list-models`) before landing this.
   modelsFile = jsonFormat.generate "pi-models.json" {
     providers = {
       ollama = {
@@ -47,7 +49,7 @@ let
           supportsDeveloperRole = false;
           supportsReasoningEffort = false;
         };
-        models = cfg.ollama.models;
+        models = [ { id = cfg.ollama.model; } ];
       };
     };
   };
@@ -72,7 +74,7 @@ let
       mkdir -p $out
       cp -r . $out/
       cp ${settingsFile} $out/settings.json
-      ${lib.optionalString (cfg.ollama.enable && cfg.ollama.models != [ ]) ''
+      ${lib.optionalString cfg.ollama.enable ''
         cp ${modelsFile} $out/models.json
       ''}
       cp ${entrypointScript} $out/entrypoint.sh
@@ -132,6 +134,12 @@ let
     cp -f /opt/pi/settings.json "$HOME/.pi/agent/settings.json"
     if [ -f /opt/pi/models.json ]; then
       cp -f /opt/pi/models.json "$HOME/.pi/agent/models.json"
+    else
+      # models.json rides a persistent volume (/root/.pi/agent survives
+      # dispatches); if ollama is disabled after previously being enabled, a
+      # stale copy would keep pointing pi at a dead endpoint forever. Force
+      # this to match settings.json's unconditional overwrite above.
+      rm -f "$HOME/.pi/agent/models.json"
     fi
 
     # GitHub auth for clone/push. The PAT rides in on a ro bind-mount of the sops
@@ -365,10 +373,9 @@ in
         description = "OpenAI-completions-compatible base URL of the Ollama endpoint, reachable from the container network.";
       };
 
-      models = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [ ];
-        description = "Model ids pulled on the Ollama endpoint to expose under the ollama/ provider prefix. models.json is only generated when this is non-empty.";
+      model = lib.mkOption {
+        type = lib.types.str;
+        description = "The single model id pulled on the Ollama endpoint, exposed as ollama/<id>. An ollama-routed worker runs exactly one model; there's no meaningful case for a list here.";
       };
     };
   };
