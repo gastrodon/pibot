@@ -159,8 +159,8 @@ $guidance"
     # agent loop headlessly on this build (upstream pi 0.84.1 stdin bug: after a
     # tool result the run aborts at turn 2 with no agent_end — earendil-works/pi
     # #4303/#2381). RPC holds the connection open and runs the full multi-turn loop
-    # to agent_end. We open a fifo as pi's stdin, send one prompt, stream events to
-    # pi.jsonl, wait for agent_end, then close stdin so pi exits cleanly.
+    # to agent_settled. We open a fifo as pi's stdin, send one prompt, stream events
+    # to pi.jsonl, wait for agent_settled, then close stdin so pi exits cleanly.
     # ask_question is disabled (a no-op headlessly); the system prompt tells pi to
     # ask by ending its turn with a question instead.
     fifo=/local/rpcin
@@ -174,10 +174,22 @@ $guidance"
     exec 3>"$fifo"
     printf '{"type":"prompt","message":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)" >&3
 
-    # Wait for the session to settle (agent_end), bounded by a 30m deadline.
+    # Wait for the session to settle, bounded by a 30m deadline.
+    #
+    # The sentinel MUST be agent_settled, not agent_end. agent_end fires once per
+    # *low-level* agent run and is explicitly "may still be followed by retry,
+    # compaction, or queued continuations" (docs/rpc.md); it carries willRetry:true
+    # when an auto-retry (529/rate-limit/5xx) or an overflow-compaction retry is
+    # about to resume the run. Breaking on the first agent_end therefore killed pi
+    # mid-flight on any retried session: the work was left half-done, and because
+    # the turns up to that point are typically thinking+toolCall with no text block,
+    # the reply came out empty and Linear got the "pi completed without a text
+    # response." fallback. agent_settled is the terminal event — no retry,
+    # compaction retry, or queued continuation remains. (Added upstream in 0.80.4;
+    # this image pins 0.84.1, so it is always emitted.)
     deadline=$(( $(date +%s) + 1800 ))
     while kill -0 "$pipid" 2>/dev/null; do
-      if grep -q '"type":"agent_end"' /local/pi.jsonl 2>/dev/null; then break; fi
+      if grep -q '"type":"agent_settled"' /local/pi.jsonl 2>/dev/null; then break; fi
       if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
       sleep 2
     done
@@ -187,14 +199,25 @@ $guidance"
     for _ in $(seq 1 10); do kill -0 "$pipid" 2>/dev/null || break; sleep 1; done
     kill "$pipid" 2>/dev/null || true
     if wait "$pipid" 2>/dev/null; then rc=0; else rc=$?; fi
-    # agent_end means the work completed even if we had to close/kill to exit.
-    if grep -q '"type":"agent_end"' /local/pi.jsonl 2>/dev/null; then rc=0; fi
+    # agent_settled means the work completed even if we had to close/kill to exit.
+    if grep -q '"type":"agent_settled"' /local/pi.jsonl 2>/dev/null; then rc=0; fi
 
     # Assemble the reply from the authoritative message_end events — clean assistant
     # text blocks only. (Do NOT concatenate message_update deltas: that stream
     # interleaves thinking text and raw tool-call arg JSON.)
-    jq -r 'select(.type=="message_end") | .message | select(.role=="assistant") | .content[]? | select(.type=="text") | .text' \
-      /local/pi.jsonl > /local/pi-out.txt 2>/dev/null || true
+    #
+    # Take the LAST assistant message that has text, not every one concatenated:
+    # the system prompt tells pi its *final* message is what gets posted, so the
+    # intermediate between-tool narration is not meant for the Linear thread.
+    # Emit as a compact JSON string (one line, newlines escaped) so `tail -n 1`
+    # picks the final record even when the reply is multi-line, then decode it.
+    # Streaming jq (not -s) also means a truncated final line — possible when we
+    # had to kill pi — is skipped instead of voiding the whole extraction.
+    jq -c 'select(.type=="message_end") | .message | select(.role=="assistant")
+           | [.content[]? | select(.type=="text") | .text] | join("\n")
+           | select(length > 0)' /local/pi.jsonl 2>/dev/null \
+      | tail -n 1 > /local/pi-last.json || true
+    jq -r '.' /local/pi-last.json > /local/pi-out.txt 2>/dev/null || : > /local/pi-out.txt
 
     if [ "$rc" -ne 0 ]; then
       act=error
