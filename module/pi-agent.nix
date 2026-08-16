@@ -60,7 +60,8 @@ let
   # the system closure: the job JSON embeds "docker-archive:${piImage}" and the
   # podman driver's docker-archive: transport ImageLoads that store path — no
   # registry, no push. Carries only the entrypoint's needs: git (clone/push +
-  # pi-black's git: install), curl (Linear post), jq (JSON build), bash,
+  # pi-black's git: install), nodejs (pi-black's install shells `npm install`),
+  # curl (Linear post), jq (JSON build), gh (PR creation, reads GH_TOKEN), bash,
   # coreutils, cacert. pi itself is NOT baked — it rides the /opt/pi bind-mount.
   # glibc supplies /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
   piImage = pkgs.dockerTools.buildLayeredImage {
@@ -68,8 +69,10 @@ let
     tag = "latest";
     contents = [
       pkgs.git
+      pkgs.nodejs
       pkgs.curl
       pkgs.jq
+      pkgs.gh
       pkgs.bashInteractive
       pkgs.coreutils
       pkgs.cacert
@@ -102,8 +105,8 @@ let
 
     # GitHub auth for clone/push. The PAT rides in on a ro bind-mount of the sops
     # secret; feed it to git via a credential helper (keeps it out of .gitconfig)
-    # and export GH_TOKEN/GITHUB_TOKEN for anything that reads the env. gh is NOT
-    # in the base image — API/PR creation via gh needs it added first.
+    # and export GH_TOKEN/GITHUB_TOKEN — gh (baked in the image) reads these for
+    # PR creation, no separate `gh auth login` needed.
     if [ -f /run/github-pat ]; then
       GH_TOKEN="$(cat /run/github-pat)"
       export GH_TOKEN
@@ -111,6 +114,16 @@ let
       git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
       git config --global user.name pibot
       git config --global user.email pibot@users.noreply.github.com
+    fi
+
+    # Linear access for pi, as the pibot APP identity (never Eva's personal key).
+    # The receiver passes a short-lived OAuth app token per dispatch in
+    # NOMAD_META_access_token; surface it as LINEAR_ACCESS_TOKEN so pi's run can
+    # reach it. It's an OAuth token, so Linear wants `Authorization: Bearer
+    # <token>` (curl+jq — schpet/linear-cli can't carry it: it sends the key raw
+    # with no Bearer prefix, which only authenticates personal API keys).
+    if [ -n "''${NOMAD_META_access_token:-}" ]; then
+      export LINEAR_ACCESS_TOKEN="$NOMAD_META_access_token"
     fi
 
     # Extract the prompt from the raw webhook. The exact field is unconfirmed
