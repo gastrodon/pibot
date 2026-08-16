@@ -91,14 +91,14 @@ in
 
     allowedModels = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ cfg.defaultModel ];
-      defaultText = lib.literalExpression "[ config.services.linearAgent.defaultModel ]";
+      default = [ ];
       description = ''
         Models a `pibot: model=...` directive may request. A directive naming
         anything else gets rejected with an `error` activity instead of being
-        dispatched. Add an entry per model you actually want reachable (e.g.
-        an `ollama/<id>` once services.piAgent.ollama is live) — empty disables
-        validation entirely.
+        dispatched. Empty (the default) disables validation, so any directive
+        is dispatched as-is; set this once there's a real roster of reachable
+        models worth enforcing, e.g. `services.piAgent.defaultModel` plus an
+        `ollama/<id>` once a local endpoint exists.
       '';
     };
   };

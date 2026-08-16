@@ -120,9 +120,10 @@ pibot: model=ollama/qwen2.5-coder:7b thinking=off
 Only the single triggering message is parsed (the initiating comment, or the
 latest prompt on a follow-up) — never the accumulated thread history — and
 only its last line, so it can't be mistaken for prose earlier in the body. A
-requested model that isn't in `services.linearAgent.allowedModels` (default:
-just `defaultModel`) is rejected with an `error` activity on the thread
-instead of being dispatched. `settings.json`'s
+requested model that isn't in `services.linearAgent.allowedModels` is
+rejected with an `error` activity on the thread instead of being dispatched;
+the list is empty (validation off, any directive dispatches) until there's a
+real roster worth enforcing. `settings.json`'s
 `defaultProvider`/`defaultModel`/`defaultThinkingLevel` only matter as the
 fallback for dispatches with no Meta at all (e.g. a manual `nomad job dispatch`
 with `model`/`thinking` omitted).
