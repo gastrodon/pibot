@@ -94,9 +94,17 @@ let
   # pi-black's git: install), nodejs (pi-black's install shells `npm install`),
   # curl (Linear post), jq (JSON build), gh (PR creation, reads GH_TOKEN), grep +
   # findutils (pi's bash tool reflexively shells `find … | grep …` to explore —
-  # coreutils supplies neither), bash, coreutils, cacert. pi itself is NOT baked —
-  # it rides the /opt/pi bind-mount. glibc supplies /lib64/ld-linux-x86-64.so.2 so
-  # the unpatched Bun exec runs here.
+  # coreutils supplies neither), bash, coreutils, cacert. nix lets pibot
+  # build/test gastrodon/dotfiles the same way CI does — `nix build
+  # .#nixosConfigurations.<host>.config.system.build.toplevel --impure` and
+  # `nix flake check`/`nixfmt --check`. sandbox is disabled: the podman task runs
+  # unprivileged and can't create the user/mount namespaces a sandboxed nix build
+  # needs; build-users-group is left unset so nix builds directly as the container's
+  # root user (no nixbld users exist here). Store state is not persisted across
+  # dispatches — see README for why, and the still-open gap around private
+  # git+ssh flake inputs (e.g. free-code) whose fetch requires an SSH key.
+  # pi itself is NOT baked — it rides the /opt/pi bind-mount. glibc supplies
+  # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -112,6 +120,7 @@ let
       pkgs.coreutils
       pkgs.cacert
       pkgs.glibc
+      pkgs.nix
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -122,6 +131,8 @@ let
         "LD_LIBRARY_PATH=${pkgs.glibc}/lib"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false"
         "SHELL=/bin/bash"
         "HOME=/root"
       ];

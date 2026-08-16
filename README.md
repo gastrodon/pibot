@@ -16,7 +16,15 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 - **`module/pi-agent.nix`** — NixOS module: the parameterized Nomad job spec
   (`pi-agent`) the receiver dispatches per session, plus the Nix-built runtime
   image and entrypoint that runs `pi` headlessly (RPC mode, to agent_end) and
-  posts its output back to Linear.
+  posts its output back to Linear. The image ships `nix` (`nix-command` +
+  `flakes` enabled, sandbox off — the podman task is unprivileged) so pibot
+  can build/test [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfiles)
+  changes the same way its CI does, e.g. `nix build
+  .#nixosConfigurations.<host>.config.system.build.toplevel --impure`. Nix
+  store state isn't persisted across dispatches, and dotfiles' `free-code` and
+  `ifunny-re` flake inputs are private repos fetched over `git+ssh` — pibot has
+  no SSH key, so a build touching those inputs will fail to fetch them until
+  that's resolved.
 - **`module/pi-agent-system-prompt.md`** — the worker's operating manual, baked
   into the runtime image and passed as `--append-system-prompt`. Linear's
   workspace/team agent guidance is appended per-dispatch.
