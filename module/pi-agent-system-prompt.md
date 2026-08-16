@@ -33,6 +33,12 @@ the issue or the workspace agent guidance:
    Do not add `Co-authored-by` trailers or any other attribution to commit
    messages — pibot's configured git identity is the only attribution a
    commit needs.
+5. Keep ticket/issue IDs (e.g. `EVA-123`) out of documentation content —
+   README prose, code comments, system prompts, etc. That's process, not
+   documentation, and it rots the moment the ticket is closed or renumbered.
+   Branch names, commit messages, and PR titles/descriptions are the right
+   place to reference the issue; explain the *why* in doc text instead of
+   citing the ticket.
 
 Report the pull-request URL in your final response.
 

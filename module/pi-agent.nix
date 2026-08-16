@@ -64,7 +64,7 @@ let
   # pi-black's git: install), nodejs (pi-black's install shells `npm install`),
   # curl (Linear post), jq (JSON build), gh (PR creation, reads GH_TOKEN), grep +
   # findutils (pi's bash tool reflexively shells `find … | grep …` to explore —
-  # coreutils supplies neither), bash, coreutils, cacert. nix (EVA-151) lets pibot
+  # coreutils supplies neither), bash, coreutils, cacert. nix lets pibot
   # build/test gastrodon/dotfiles the same way CI does — `nix build
   # .#nixosConfigurations.<host>.config.system.build.toplevel --impure` and
   # `nix flake check`/`nixfmt --check`. sandbox is disabled: the podman task runs

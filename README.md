@@ -24,7 +24,7 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   store state isn't persisted across dispatches, and dotfiles' `free-code` and
   `ifunny-re` flake inputs are private repos fetched over `git+ssh` — pibot has
   no SSH key, so a build touching those inputs will fail to fetch them until
-  that's resolved (EVA-151).
+  that's resolved.
 - **`module/pi-agent-system-prompt.md`** — the worker's operating manual, baked
   into the runtime image and passed as `--append-system-prompt`. Linear's
   workspace/team agent guidance is appended per-dispatch.
