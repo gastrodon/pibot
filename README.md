@@ -68,3 +68,22 @@ Add this flake as an input and import the modules you need:
 `services.piAgent` expects a Nomad client with `meta.pi_worker = "true"` (see
 the `pi_worker` constraint in `module/pi-agent.nix`) and a persistent
 `/var/lib/pi-agent/home` volume for `pi`'s auth state.
+
+### Routing the fleet at a different model
+
+`services.piAgent.{provider,model,thinkingLevel}` set what every dispatched
+session runs, via `settings.json`:
+
+```nix
+services.piAgent = {
+  provider = "ollama";
+  model = "qwen2.5-coder:7b";
+  thinkingLevel = "off";
+};
+```
+
+This is fleet-wide, not per-session. The entrypoint honours `--model` /
+`--thinking` from `NOMAD_META_model` / `NOMAD_META_thinking`, but
+`linear-agent`'s `dispatchNomad` never sends them, so Linear-originated
+sessions always fall through to these defaults. Mixing providers per request
+needs receiver work (EVA-111); until then, changing provider is a rebuild.

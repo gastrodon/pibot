@@ -22,12 +22,18 @@ let
   # settings.json for the pi agent. Nix is authoritative — the entrypoint copies
   # this over the volume copy every dispatch, so Eva's tweaks flow through
   # rebuilds. defaultProjectTrust=always is required because -p is non-interactive
-  # (no trust prompt) and pi-black is loaded as a package. Model ID is a best
-  # guess — verify the real sonnet-5 catalog id with `pi update --models`.
+  # (no trust prompt) and pi-black is loaded as a package.
+  #
+  # These defaults are what every dispatch actually runs: the receiver
+  # (linear-agent's dispatchNomad) sends no `model` Meta, so the entrypoint's
+  # --model/--thinking overrides are unset for Linear-originated sessions and pi
+  # falls back to settings.json. Routing the fleet at a different provider is
+  # therefore a settings change, not a receiver change — see services.piAgent
+  # .{provider,model,thinkingLevel}.
   settingsFile = jsonFormat.generate "pi-settings.json" {
-    defaultProvider = "anthropic";
-    defaultModel = "claude-sonnet-5";
-    defaultThinkingLevel = "high";
+    defaultProvider = cfg.provider;
+    defaultModel = cfg.model;
+    defaultThinkingLevel = cfg.thinkingLevel;
     defaultProjectTrust = "always";
     packages = [ "git:github.com/paoloanzn/pi-black@v0.84.1-cc2.1.224.4" ];
   };
@@ -305,6 +311,47 @@ in
     nomadBootstrapTokenFile = lib.mkOption {
       type = lib.types.path;
       description = "Path to a file containing the Nomad ACL management token, used to register the job.";
+    };
+
+    provider = lib.mkOption {
+      type = lib.types.str;
+      default = "anthropic";
+      description = ''
+        Provider every dispatched session routes to, written to settings.json as
+        defaultProvider. "anthropic" (via pi-black, on the subscription) by
+        default; set to a custom provider id such as "ollama" to route the whole
+        fleet locally. This is fleet-wide — per-session routing needs the
+        receiver to send a `model` dispatch Meta, which it does not do yet.
+      '';
+    };
+
+    model = lib.mkOption {
+      type = lib.types.str;
+      default = "claude-sonnet-5";
+      description = ''
+        Model id every dispatched session runs, written to settings.json as
+        defaultModel. Must be a model the configured provider exposes: a catalog
+        id for a built-in provider (verify with `pi update --models`), or the id
+        declared in models.json for a custom one.
+      '';
+    };
+
+    thinkingLevel = lib.mkOption {
+      type = lib.types.enum [
+        "off"
+        "minimal"
+        "low"
+        "medium"
+        "high"
+        "xhigh"
+        "max"
+      ];
+      default = "high";
+      description = ''
+        Thinking level written to settings.json as defaultThinkingLevel. Local
+        models generally want "off" — most don't support reasoning at all, and
+        compat.supportsReasoningEffort is disabled for the ollama provider.
+      '';
     };
   };
 
