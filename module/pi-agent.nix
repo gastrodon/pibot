@@ -24,14 +24,11 @@ let
   # rebuilds. defaultProjectTrust=always is required because -p is non-interactive
   # (no trust prompt) and pi-black is loaded as a package.
   #
-  # These defaults are now the *fallback* only: the receiver (linear-agent's
-  # dispatchNomad) always sends `model`/`thinking` Meta — see
-  # services.linearAgent.defaultModel/defaultThinking in linear-agent.nix, which
-  # should be kept in sync with provider/model/thinkingLevel below. settings.json
-  # is what a dispatch falls back to only when Meta is absent entirely (e.g. a
-  # manual `nomad job dispatch` that omits `model`/`thinking`). Routing the
-  # fleet at the ollama provider below still requires updating both places
-  # until per-request routing (EVA-111) picks a model some other way.
+  # These defaults are the fallback only: the receiver (linear-agent's
+  # dispatchNomad) always sends `model`/`thinking` Meta, sourced from
+  # services.linearAgent.defaultModel/defaultThinking — keep those in sync with
+  # provider/model/thinkingLevel below. settings.json only matters when a
+  # dispatch carries no Meta at all (e.g. a manual `nomad job dispatch`).
   settingsFile = jsonFormat.generate "pi-settings.json" {
     defaultProvider = cfg.provider;
     defaultModel = cfg.model;
@@ -310,11 +307,8 @@ let
 
   # API JSON shape for POST /v1/jobs — the { Job = {...}; } wrapper is the exact
   # request body. Meta keys declared here must match dispatchNomad exactly or
-  # Nomad rejects the dispatch. model/thinking stay MetaOptional even though the
-  # receiver now always sends both (defaulting to services.linearAgent.
-  # defaultModel/defaultThinking) — a manual `nomad job dispatch` may still omit
-  # them, falling back to settings.json. Per-request routing beyond that single
-  # configured default is future work (EVA-111).
+  # Nomad rejects the dispatch. model/thinking stay MetaOptional since a manual
+  # `nomad job dispatch` may omit them, falling back to settings.json.
   jobFile = jsonFormat.generate "pi-agent.json" {
     Job = {
       ID = "pi-agent";
@@ -394,11 +388,10 @@ in
         defaultProvider (the fallback used when a dispatch carries no `model`
         Meta at all). "anthropic" (via pi-black, on the subscription) by
         default; set to "ollama" — together with ollama.enable — to route the
-        whole fleet at the local endpoint. This is fleet-wide: keep it in sync
-        with services.linearAgent.defaultModel, which is what the receiver
-        actually sends as `model` Meta on every real dispatch. Per-request
-        routing that picks a *different* model per session is future work
-        (EVA-111).
+        whole fleet at the local endpoint. Keep this in sync with
+        services.linearAgent.defaultModel, which is what the receiver actually
+        sends as `model` Meta by default (a per-request `pibot: model=...`
+        directive can override it).
       '';
     };
 

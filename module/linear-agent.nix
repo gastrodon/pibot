@@ -64,11 +64,11 @@ in
       type = lib.types.str;
       default = "anthropic/claude-sonnet-5";
       description = ''
-        `provider/id` sent as the `model` dispatch Meta on every session
-        (pi's --model form), until per-request routing (EVA-111) can pick a
-        different value per dispatch. Keep in sync with
-        services.piAgent.provider + services.piAgent.model, which settings.json
-        falls back to only when a dispatch carries no `model` Meta at all.
+        `provider/id` sent as the `model` dispatch Meta (pi's --model form)
+        when a session carries no `pibot: model=...` override. Keep in sync
+        with services.piAgent.provider + services.piAgent.model, which
+        settings.json falls back to only when a dispatch carries no `model`
+        Meta at all.
       '';
     };
 
@@ -84,8 +84,21 @@ in
       ];
       default = "high";
       description = ''
-        Thinking level sent as the `thinking` dispatch Meta on every session.
-        Keep in sync with services.piAgent.thinkingLevel.
+        Thinking level sent as the `thinking` dispatch Meta when a session
+        carries no override. Keep in sync with services.piAgent.thinkingLevel.
+      '';
+    };
+
+    allowedModels = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ cfg.defaultModel ];
+      defaultText = lib.literalExpression "[ config.services.linearAgent.defaultModel ]";
+      description = ''
+        Models a `pibot: model=...` directive may request. A directive naming
+        anything else gets rejected with an `error` activity instead of being
+        dispatched. Add an entry per model you actually want reachable (e.g.
+        an `ollama/<id>` once services.piAgent.ollama is live) — empty disables
+        validation entirely.
       '';
     };
   };
@@ -114,6 +127,7 @@ in
         LINEAR_CLIENT_SECRET_FILE = cfg.clientSecretFile;
         DEFAULT_MODEL = cfg.defaultModel;
         DEFAULT_THINKING = cfg.defaultThinking;
+        ALLOWED_MODELS = lib.concatStringsSep "," cfg.allowedModels;
       }
       // lib.optionalAttrs (cfg.nomadTokenFile != null) {
         NOMAD_TOKEN_FILE = cfg.nomadTokenFile;

@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,9 @@ type config struct {
 	nomadJob        string
 	defaultModel    string
 	defaultThinking string
+	// allowedModels validates a directive-supplied model before dispatch; empty
+	// means skip validation. See modelAllowed.
+	allowedModels []string
 }
 
 func loadConfig() config {
@@ -75,26 +79,34 @@ func loadConfig() config {
 	// serves) before the Linear app exists. Webhooks are rejected until the
 	// signing secret is set; see handleWebhook.
 	return config{
-		listenAddr:    get("LISTEN_ADDR", ":3456"),
-		webhookSecret: []byte(secretOrFile("LINEAR_WEBHOOK_SECRET")),
-		refreshToken:  secretOrFile("LINEAR_REFRESH_TOKEN"),
-		clientID:      secretOrFile("LINEAR_CLIENT_ID"),
-		clientSecret:  secretOrFile("LINEAR_CLIENT_SECRET"),
-		stateDir:      os.Getenv("STATE_DIR"),
-		nomadAddr:     get("NOMAD_ADDR", "http://127.0.0.1:4646"),
-		nomadToken:    secretOrFile("NOMAD_TOKEN"),
-		nomadJob:      get("NOMAD_JOB", "pi-agent"),
-		// Migration step (EVA-111): the model/thinking default used to live solely
-		// in pi-agent's settings.json (baked in by Nix, requiring a rebuild to
-		// change). It now flows through dispatch Meta instead — same default
-		// value, but a surface the receiver can override per-request later
-		// without touching settings.json. settings.json's defaultProvider/
-		// defaultModel/defaultThinkingLevel remain only as the fallback for
-		// dispatches that carry no Meta at all (e.g. a manual `nomad job
-		// dispatch`).
+		listenAddr:      get("LISTEN_ADDR", ":3456"),
+		webhookSecret:   []byte(secretOrFile("LINEAR_WEBHOOK_SECRET")),
+		refreshToken:    secretOrFile("LINEAR_REFRESH_TOKEN"),
+		clientID:        secretOrFile("LINEAR_CLIENT_ID"),
+		clientSecret:    secretOrFile("LINEAR_CLIENT_SECRET"),
+		stateDir:        os.Getenv("STATE_DIR"),
+		nomadAddr:       get("NOMAD_ADDR", "http://127.0.0.1:4646"),
+		nomadToken:      secretOrFile("NOMAD_TOKEN"),
+		nomadJob:        get("NOMAD_JOB", "pi-agent"),
 		defaultModel:    get("DEFAULT_MODEL", "anthropic/claude-sonnet-5"),
 		defaultThinking: get("DEFAULT_THINKING", "high"),
+		allowedModels:   splitNonEmpty(os.Getenv("ALLOWED_MODELS"), ","),
 	}
+}
+
+// splitNonEmpty splits s on sep, trims whitespace, and drops empty pieces. A
+// blank s returns nil.
+func splitNonEmpty(s, sep string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, sep) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // agentSessionEvent is the subset of the Linear webhook we act on.
@@ -102,8 +114,80 @@ type agentSessionEvent struct {
 	Type         string `json:"type"`
 	Action       string `json:"action"`
 	AgentSession struct {
-		ID string `json:"id"`
+		ID      string `json:"id"`
+		Comment struct {
+			Body string `json:"body"`
+		} `json:"comment"`
 	} `json:"agentSession"`
+	AgentActivity struct {
+		Content struct {
+			Body string `json:"body"`
+		} `json:"content"`
+	} `json:"agentActivity"`
+}
+
+// triggerBody returns the single message that triggered this event — the
+// initiating comment on `created`, the latest prompt on `prompted` — never
+// the accreted promptContext thread history. Directives are parsed only from
+// this field, so they're unaffected by shrinkPayload's truncation.
+func (ev agentSessionEvent) triggerBody() string {
+	switch ev.Action {
+	case "created":
+		return ev.AgentSession.Comment.Body
+	case "prompted":
+		return ev.AgentActivity.Content.Body
+	default:
+		return ""
+	}
+}
+
+// directiveLineRe matches a trailing `pibot: key=value ...` directive — only
+// the last non-blank line of the triggering message, so it can't be mistaken
+// for prose earlier in the body.
+var directiveLineRe = regexp.MustCompile(`(?i)^pibot:\s*(\S.*)$`)
+var directiveKVRe = regexp.MustCompile(`(\w+)=(\S+)`)
+
+// parseDirective extracts key=value pairs from body's trailing directive
+// line. Returns nil if there is none.
+func parseDirective(body string) map[string]string {
+	lines := strings.Split(strings.TrimRight(body, " \t\r\n"), "\n")
+	m := directiveLineRe.FindStringSubmatch(strings.TrimSpace(lines[len(lines)-1]))
+	if m == nil {
+		return nil
+	}
+	kv := map[string]string{}
+	for _, pair := range directiveKVRe.FindAllStringSubmatch(m[1], -1) {
+		kv[strings.ToLower(pair[1])] = pair[2]
+	}
+	return kv
+}
+
+// resolveRouting picks the model/thinking dispatch Meta: a trailing `pibot:`
+// directive on the triggering message overrides the configured default.
+func (c *client) resolveRouting(ev agentSessionEvent) (model, thinking string) {
+	model, thinking = c.cfg.defaultModel, c.cfg.defaultThinking
+	d := parseDirective(ev.triggerBody())
+	if v := d["model"]; v != "" {
+		model = v
+	}
+	if v := d["thinking"]; v != "" {
+		thinking = v
+	}
+	return model, thinking
+}
+
+// modelAllowed reports whether model may be dispatched. An empty allowlist
+// (the default) means validation is off.
+func (c *client) modelAllowed(model string) bool {
+	if len(c.cfg.allowedModels) == 0 {
+		return true
+	}
+	for _, m := range c.cfg.allowedModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
 }
 
 // tokenState is the refreshable OAuth material. Persisted to the state dir so
@@ -230,7 +314,16 @@ func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
 		log.Printf("thought ack failed for session %s: %v", ev.AgentSession.ID, err)
 	}
 
-	if err := c.dispatchNomad(ctx, ev, raw); err != nil {
+	model, thinking := c.resolveRouting(ev)
+	if !c.modelAllowed(model) {
+		msg := fmt.Sprintf("Unknown model %q — not starting an agent. Known models: %s", model, strings.Join(c.cfg.allowedModels, ", "))
+		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
+			log.Printf("error activity failed for session %s: %v", ev.AgentSession.ID, e)
+		}
+		return
+	}
+
+	if err := c.dispatchNomad(ctx, ev, raw, model, thinking); err != nil {
 		log.Printf("nomad dispatch failed for session %s: %v", ev.AgentSession.ID, err)
 		msg := fmt.Sprintf("Couldn't start the agent job: %v", err)
 		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
@@ -394,7 +487,7 @@ func (c *client) refreshLocked(ctx context.Context) error {
 // dispatchNomad kicks the parameterized batch job, passing the (possibly
 // shrunk, see shrinkPayload) webhook as the dispatch payload and the session
 // id as dispatch meta.
-func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []byte) error {
+func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []byte, model, thinking string) error {
 	// The receiver is the sole owner of the refresh token; hand the job only a
 	// short-lived access token (no refresh material) so it can post one response
 	// activity without a second refresher rotating tokens out from under us.
@@ -412,12 +505,8 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []
 			"session_id":   ev.AgentSession.ID,
 			"action":       ev.Action,
 			"access_token": token,
-			// Every dispatch now carries an explicit model/thinking selection —
-			// currently always the configured default (DEFAULT_MODEL/
-			// DEFAULT_THINKING), since nothing yet derives a per-request override
-			// from the triggering event. That's the remaining piece of EVA-111.
-			"model":    c.cfg.defaultModel,
-			"thinking": c.cfg.defaultThinking,
+			"model":        model,
+			"thinking":     thinking,
 		},
 	}
 	buf, _ := json.Marshal(body)
