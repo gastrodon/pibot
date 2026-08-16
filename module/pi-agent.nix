@@ -53,6 +53,7 @@ let
       cp -r . $out/
       cp ${settingsFile} $out/settings.json
       cp ${entrypointScript} $out/entrypoint.sh
+      cp ${./pi-agent-system-prompt.md} $out/system-prompt.md
     '';
   };
 
@@ -61,9 +62,11 @@ let
   # podman driver's docker-archive: transport ImageLoads that store path — no
   # registry, no push. Carries only the entrypoint's needs: git (clone/push +
   # pi-black's git: install), nodejs (pi-black's install shells `npm install`),
-  # curl (Linear post), jq (JSON build), gh (PR creation, reads GH_TOKEN), bash,
-  # coreutils, cacert. pi itself is NOT baked — it rides the /opt/pi bind-mount.
-  # glibc supplies /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
+  # curl (Linear post), jq (JSON build), gh (PR creation, reads GH_TOKEN), grep +
+  # findutils (pi's bash tool reflexively shells `find … | grep …` to explore —
+  # coreutils supplies neither), bash, coreutils, cacert. pi itself is NOT baked —
+  # it rides the /opt/pi bind-mount. glibc supplies /lib64/ld-linux-x86-64.so.2 so
+  # the unpatched Bun exec runs here.
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -73,6 +76,8 @@ let
       pkgs.curl
       pkgs.jq
       pkgs.gh
+      pkgs.gnugrep
+      pkgs.findutils
       pkgs.bashInteractive
       pkgs.coreutils
       pkgs.cacert
@@ -137,11 +142,52 @@ let
     think_args=""
     if [ -n "''${NOMAD_META_thinking:-}" ]; then think_args="--thinking ''${NOMAD_META_thinking}"; fi
 
-    if timeout 30m /opt/pi/pi -p "$prompt" $model_args $think_args >/local/pi-out.txt 2>/local/pi-err.txt; then
-      act=response
+    # System prompt: the Nix-managed operating manual (edited as prose in
+    # pi-agent-system-prompt.md), with Linear's workspace/team agent guidance
+    # appended per-dispatch. Linear delivers guidance as a top-level webhook field
+    # (free-form markdown for the agent); empty when unset.
+    sys=$(cat /opt/pi/system-prompt.md)
+    guidance=$(jq -r '.guidance // ""' /local/webhook.json)
+    if [ -n "$guidance" ]; then
+      sys="$sys
+
+## Workspace agent guidance (from Linear)
+$guidance"
+    fi
+
+    # Run pi in JSON event-stream mode, NOT -p. -p prints only a final text turn,
+    # so an agentic run that ends on tool use emits nothing (that was the empty-post
+    # bug). --mode json streams every event; we reconstruct the reply afterwards.
+    # ask_question is disabled: it's a no-op in non-interactive mode, so the system
+    # prompt tells pi to ask by ending its turn with a question instead.
+    if timeout 30m /opt/pi/pi --mode json \
+      --append-system-prompt "$sys" \
+      --exclude-tools ask_question \
+      "$prompt" $model_args $think_args >/local/pi.jsonl 2>/local/pi-err.txt; then
+      rc=0
     else
+      rc=$?
+    fi
+
+    # Assemble the reply from the authoritative message_end events — clean assistant
+    # text blocks only. (Do NOT concatenate message_update deltas: that stream
+    # interleaves thinking text and raw tool-call arg JSON.)
+    jq -r 'select(.type=="message_end") | .message | select(.role=="assistant") | .content[]? | select(.type=="text") | .text' \
+      /local/pi.jsonl > /local/pi-out.txt 2>/dev/null || true
+
+    if [ "$rc" -ne 0 ]; then
       act=error
-      { echo "pi exited nonzero:"; cat /local/pi-err.txt; } >/local/pi-out.txt
+      { echo "pi exited nonzero (rc=$rc):"; tail -n 40 /local/pi-err.txt; } > /local/pi-out.txt
+    elif [ ! -s /local/pi-out.txt ]; then
+      # Never post an empty comment: fall back to a tool-run summary so the Linear
+      # thread always carries signal about what pi did.
+      act=response
+      { echo "pi completed without a text response.";
+        tools=$(jq -r 'select(.type=="tool_execution_start") | .toolName' /local/pi.jsonl 2>/dev/null | sort | uniq -c);
+        if [ -n "$tools" ]; then echo; echo "tools run:"; echo "$tools"; fi
+      } > /local/pi-out.txt
+    else
+      act=response
     fi
 
     # Build the GraphQL body with jq so pi's output (quotes/newlines/backslashes)
