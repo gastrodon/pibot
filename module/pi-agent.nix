@@ -155,19 +155,40 @@ let
 $guidance"
     fi
 
-    # Run pi in JSON event-stream mode, NOT -p. -p prints only a final text turn,
-    # so an agentic run that ends on tool use emits nothing (that was the empty-post
-    # bug). --mode json streams every event; we reconstruct the reply afterwards.
-    # ask_question is disabled: it's a no-op in non-interactive mode, so the system
-    # prompt tells pi to ask by ending its turn with a question instead.
-    if timeout 30m /opt/pi/pi --mode json \
+    # Drive pi in RPC mode. -p and --mode json do NOT autonomously continue the
+    # agent loop headlessly on this build (upstream pi 0.84.1 stdin bug: after a
+    # tool result the run aborts at turn 2 with no agent_end — earendil-works/pi
+    # #4303/#2381). RPC holds the connection open and runs the full multi-turn loop
+    # to agent_end. We open a fifo as pi's stdin, send one prompt, stream events to
+    # pi.jsonl, wait for agent_end, then close stdin so pi exits cleanly.
+    # ask_question is disabled (a no-op headlessly); the system prompt tells pi to
+    # ask by ending its turn with a question instead.
+    fifo=/local/rpcin
+    rm -f "$fifo"
+    mkfifo "$fifo"
+    /opt/pi/pi --mode rpc \
       --append-system-prompt "$sys" \
       --exclude-tools ask_question \
-      "$prompt" $model_args $think_args >/local/pi.jsonl 2>/local/pi-err.txt; then
-      rc=0
-    else
-      rc=$?
-    fi
+      $model_args $think_args <"$fifo" >/local/pi.jsonl 2>/local/pi-err.txt &
+    pipid=$!
+    exec 3>"$fifo"
+    printf '{"type":"prompt","message":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)" >&3
+
+    # Wait for the session to settle (agent_end), bounded by a 30m deadline.
+    deadline=$(( $(date +%s) + 1800 ))
+    while kill -0 "$pipid" 2>/dev/null; do
+      if grep -q '"type":"agent_end"' /local/pi.jsonl 2>/dev/null; then break; fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+      sleep 2
+    done
+
+    # Close stdin so pi exits after the run settles; force-kill if it lingers.
+    exec 3>&-
+    for _ in $(seq 1 10); do kill -0 "$pipid" 2>/dev/null || break; sleep 1; done
+    kill "$pipid" 2>/dev/null || true
+    if wait "$pipid" 2>/dev/null; then rc=0; else rc=$?; fi
+    # agent_end means the work completed even if we had to close/kill to exit.
+    if grep -q '"type":"agent_end"' /local/pi.jsonl 2>/dev/null; then rc=0; fi
 
     # Assemble the reply from the authoritative message_end events — clean assistant
     # text blocks only. (Do NOT concatenate message_update deltas: that stream
