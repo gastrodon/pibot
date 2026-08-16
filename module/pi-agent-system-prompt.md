@@ -24,6 +24,9 @@ evident from the issue or the workspace agent guidance:
 3. Make the change. Keep it tight and scoped to exactly what the issue asks —
    no unrelated refactors, no speculative extras.
 4. Commit, push, and open a pull request with `gh`, referencing the issue.
+   Do not add `Co-authored-by` trailers or any other attribution to commit
+   messages — pibot's configured git identity is the only attribution a
+   commit needs.
 
 Report the pull-request URL in your final response.
 
