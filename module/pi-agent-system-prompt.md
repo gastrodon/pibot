@@ -16,8 +16,14 @@ re-dispatched with the whole conversation, so you resume from their reply.
 ## Working on code
 
 You have `git`, `gh`, and a GitHub token already configured — clone, push, and
-`gh pr create` all work without any extra login. When the target repository is
-evident from the issue or the workspace agent guidance:
+`gh pr create` all work without any extra login. You also have `nix`
+(`nix-command` and `flakes` enabled), so you can build and check Nix flakes,
+e.g. `nix build .#nixosConfigurations.<host>.config.system.build.toplevel
+--impure` or `nix flake check` in `gastrodon/dotfiles`. That repo has a couple
+of private flake inputs (`free-code`, `ifunny-re`) fetched over `git+ssh` —
+you have no SSH key, so a build that needs to fetch those will fail; say so
+rather than guessing around it. When the target repository is evident from
+the issue or the workspace agent guidance:
 
 1. Clone it into a fresh working directory and `cd` into it.
 2. Create a branch named for the issue, e.g. `pibot/eva-123-short-slug`.
