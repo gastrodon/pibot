@@ -59,6 +59,48 @@ in
       default = null;
       description = "Path to a file containing the Nomad ACL token used to dispatch jobs, if ACLs are enabled.";
     };
+
+    defaultModel = lib.mkOption {
+      type = lib.types.str;
+      default = "anthropic/claude-sonnet-5";
+      description = ''
+        `provider/id` sent as the `model` dispatch Meta (pi's --model form)
+        when a session carries no `pibot: model=...` override. Keep in sync
+        with services.piAgent.provider + services.piAgent.model, which
+        settings.json falls back to only when a dispatch carries no `model`
+        Meta at all.
+      '';
+    };
+
+    defaultThinking = lib.mkOption {
+      type = lib.types.enum [
+        "off"
+        "minimal"
+        "low"
+        "medium"
+        "high"
+        "xhigh"
+        "max"
+      ];
+      default = "high";
+      description = ''
+        Thinking level sent as the `thinking` dispatch Meta when a session
+        carries no override. Keep in sync with services.piAgent.thinkingLevel.
+      '';
+    };
+
+    allowedModels = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        Models a `pibot: model=...` directive may request. A directive naming
+        anything else gets rejected with an `error` activity instead of being
+        dispatched. Empty (the default) disables validation, so any directive
+        is dispatched as-is; set this once there's a real roster of reachable
+        models worth enforcing, e.g. `services.piAgent.defaultModel` plus an
+        `ollama/<id>` once a local endpoint exists.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -83,6 +125,9 @@ in
         LINEAR_REFRESH_TOKEN_FILE = cfg.refreshTokenFile;
         LINEAR_CLIENT_ID_FILE = cfg.clientIdFile;
         LINEAR_CLIENT_SECRET_FILE = cfg.clientSecretFile;
+        DEFAULT_MODEL = cfg.defaultModel;
+        DEFAULT_THINKING = cfg.defaultThinking;
+        ALLOWED_MODELS = lib.concatStringsSep "," cfg.allowedModels;
       }
       // lib.optionalAttrs (cfg.nomadTokenFile != null) {
         NOMAD_TOKEN_FILE = cfg.nomadTokenFile;

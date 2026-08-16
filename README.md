@@ -103,15 +103,32 @@ if `ollama.enable` is later flipped off, so a stale file never points at a
 dead endpoint). An ollama-routed worker runs exactly one model, hence a single
 required `model` rather than a list.
 
-`provider`/`model`/`thinkingLevel` are the lever that actually routes traffic,
-and they are **fleet-wide**: every dispatch moves together. The entrypoint does
-honour a per-request `--model` from `NOMAD_META_model`, but `linear-agent`'s
-`dispatchNomad` (`main.go`) only ever sends `session_id`, `action`, and
-`access_token` as dispatch Meta — never `model`. So a Linear-originated session
-cannot pick its own model; only a manual
-`nomad job dispatch -meta model=ollama/<id> pi-agent` can. Mixing providers per
-request is separate receiver work (EVA-111).
+`provider`/`model`/`thinkingLevel` set the fleet-wide default. `linear-agent`'s
+`dispatchNomad` (`main.go`) always sends `model`/`thinking` dispatch Meta,
+defaulting to `services.linearAgent.defaultModel`/`defaultThinking` (which
+should match the fleet default above) — the entrypoint reads those as
+`NOMAD_META_model`/`NOMAD_META_thinking` and passes them to `pi` as
+`--model`/`--thinking`.
+
+A Linear commenter can override either per session with a trailing directive
+line on their comment or prompt:
+
+```
+pibot: model=ollama/qwen2.5-coder:7b thinking=off
+```
+
+Only the single triggering message is parsed (the initiating comment, or the
+latest prompt on a follow-up) — never the accumulated thread history — and
+only its last line, so it can't be mistaken for prose earlier in the body. A
+requested model that isn't in `services.linearAgent.allowedModels` is
+rejected with an `error` activity on the thread instead of being dispatched;
+the list is empty (validation off, any directive dispatches) until there's a
+real roster worth enforcing. `settings.json`'s
+`defaultProvider`/`defaultModel`/`defaultThinkingLevel` only matter as the
+fallback for dispatches with no Meta at all (e.g. a manual `nomad job dispatch`
+with `model`/`thinking` omitted).
 
 Note that a default model configured on the Ollama server itself has no effect
 here: pi's OpenAI-completions requests always name a model explicitly, so the
-choice has to come from `settings.json`.
+choice has to come from the `model` dispatch Meta (or, absent that,
+`settings.json`).

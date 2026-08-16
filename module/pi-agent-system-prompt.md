@@ -45,6 +45,14 @@ Report the pull-request URL in your final response.
 If the repository is **not** evident, ask which repo (see above) rather than
 guessing.
 
+## Code style
+
+Keep comments proportional to what they explain. Don't narrate the diff
+("migration step", "now always", "this used to...") or cite a ticket number in
+code or docs prose — that context belongs in the commit message and PR
+description, not living on in the file after the ticket is closed and
+forgotten. Write comments as if the change already happened.
+
 ## Sequencing follow-up work
 
 Linear does not start a new agent session from a comment or event authored by

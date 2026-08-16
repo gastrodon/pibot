@@ -24,11 +24,11 @@ let
   # rebuilds. defaultProjectTrust=always is required because -p is non-interactive
   # (no trust prompt) and pi-black is loaded as a package.
   #
-  # These defaults are what every dispatch actually runs: the receiver
-  # (linear-agent's dispatchNomad) sends no `model` Meta, so the entrypoint's
-  # --model/--thinking overrides are unset for Linear-originated sessions and pi
-  # falls back to settings.json. Routing the fleet at the ollama provider below
-  # is therefore a settings change, not a receiver change.
+  # These defaults are the fallback only: the receiver (linear-agent's
+  # dispatchNomad) always sends `model`/`thinking` Meta, sourced from
+  # services.linearAgent.defaultModel/defaultThinking — keep those in sync with
+  # provider/model/thinkingLevel below. settings.json only matters when a
+  # dispatch carries no Meta at all (e.g. a manual `nomad job dispatch`).
   settingsFile = jsonFormat.generate "pi-settings.json" {
     defaultProvider = cfg.provider;
     defaultModel = cfg.model;
@@ -307,8 +307,8 @@ let
 
   # API JSON shape for POST /v1/jobs — the { Job = {...}; } wrapper is the exact
   # request body. Meta keys declared here must match dispatchNomad exactly or
-  # Nomad rejects the dispatch. model/thinking are optional (receiver doesn't send
-  # them yet — defaults come from settings.json; per-request routing is future work).
+  # Nomad rejects the dispatch. model/thinking stay MetaOptional since a manual
+  # `nomad job dispatch` may omit them, falling back to settings.json.
   jobFile = jsonFormat.generate "pi-agent.json" {
     Job = {
       ID = "pi-agent";
@@ -385,11 +385,13 @@ in
       default = "anthropic";
       description = ''
         Provider every dispatched session routes to, written to settings.json as
-        defaultProvider. "anthropic" (via pi-black, on the subscription) by
+        defaultProvider (the fallback used when a dispatch carries no `model`
+        Meta at all). "anthropic" (via pi-black, on the subscription) by
         default; set to "ollama" — together with ollama.enable — to route the
-        whole fleet at the local endpoint. This is fleet-wide; per-session
-        routing needs the receiver to send a `model` dispatch Meta, which it
-        does not do yet.
+        whole fleet at the local endpoint. Keep this in sync with
+        services.linearAgent.defaultModel, which is what the receiver actually
+        sends as `model` Meta by default (a per-request `pibot: model=...`
+        directive can override it).
       '';
     };
 
