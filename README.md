@@ -20,7 +20,9 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   `flakes` enabled, sandbox off — the podman task is unprivileged) so pibot
   can build/test [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfiles)
   changes the same way its CI does, e.g. `nix build
-  .#nixosConfigurations.<host>.config.system.build.toplevel --impure`. Nix
+  .#nixosConfigurations.<host>.config.system.build.toplevel --impure`, and
+  `go` so pibot can `go build`/`go test`/`go vet` when it's dispatched to work
+  in a Go repo (including its own, `gastrodon/pibot`). Nix
   store state isn't persisted across dispatches, and dotfiles' `free-code` and
   `ifunny-re` flake inputs are private repos fetched over `git+ssh` — pibot has
   no SSH key, so a build touching those inputs will fail to fetch them until
