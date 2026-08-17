@@ -15,9 +15,15 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   `buildPrompt`), so the worker always runs on a coherent instruction instead
   of trying to guess a field name out of the webhook's actual shape (which
   has no `promptContext` field — verified against Linear's public GraphQL
-  schema) or, worse, the entire raw JSON body. Any one field that's still too
-  long to fit Nomad's 16KiB dispatch limit is capped with its tail kept
-  (`clip`); the triggering message itself is never capped.
+  schema) or, worse, the entire raw JSON body. The webhook itself only ever
+  carries the single triggering message, so `dispatchNomad` also fetches the
+  issue's full comment thread and this agent session's earlier activity
+  directly from Linear (`fetchThreadContext`), using the same OAuth token
+  `postActivity` posts with — that's a plain HTTPS response, not a Nomad
+  dispatch payload, so it isn't subject to the 16KiB limit below. Any one
+  section that's still too long to fit once assembled into the prompt is
+  capped with its tail kept (`clip`); the triggering message itself is never
+  capped.
 - **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
   refresh token.
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as

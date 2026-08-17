@@ -323,7 +323,7 @@ func (c *client) dispatch(ev agentSessionEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := c.postActivity(ctx, ev.AgentSession.ID, "thought", "Picking this up — spinning up an agent."); err != nil {
+	if err := c.postActivity(ctx, ev.AgentSession.ID, "thought", ackThought); err != nil {
 		log.Printf("thought ack failed for session %s: %v", ev.AgentSession.ID, err)
 	}
 
@@ -508,7 +508,17 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model,
 	if err != nil {
 		return fmt.Errorf("get access token for dispatch: %w", err)
 	}
-	payload, err := json.Marshal(map[string]string{"prompt": buildPrompt(ev)})
+	// The webhook only ever carries the single triggering message — Linear has
+	// no promptContext-shaped field that accretes the rest of the thread (see
+	// agentSessionEvent). Fetch it ourselves, with the same token, so a
+	// follow-up prompt doesn't lose track of the issue's comment thread or what
+	// pibot already did earlier in this session. A fetch failure degrades to
+	// today's narrower prompt rather than blocking the dispatch.
+	tc, err := c.fetchThreadContext(ctx, token, ev.AgentSession.ID)
+	if err != nil {
+		log.Printf("session %s: fetch thread context failed, dispatching without it: %v", ev.AgentSession.ID, err)
+	}
+	payload, err := json.Marshal(map[string]string{"prompt": buildPrompt(ev, tc)})
 	if err != nil {
 		return fmt.Errorf("marshal dispatch payload: %w", err)
 	}
@@ -516,7 +526,7 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model,
 		// Defensive only: buildPrompt already caps every field it draws from, so
 		// this should be unreachable outside pathological input. Nomad hard-rejects
 		// anything over 16KiB, so never send a dispatch un-capped regardless.
-		prompt := clip(buildPrompt(ev), maxDispatchPayload-256)
+		prompt := clip(buildPrompt(ev, tc), maxDispatchPayload-256)
 		payload, _ = json.Marshal(map[string]string{"prompt": prompt})
 		log.Printf("session %s: dispatch prompt %d bytes exceeded Nomad's %d-byte limit even after field caps, hard-truncated", ev.AgentSession.ID, len(payload), maxDispatchPayload)
 	}
@@ -559,10 +569,17 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model,
 const maxDispatchPayload = 15 * 1024
 
 // maxFieldBytes bounds any single context component buildPrompt draws from
-// (issue description, session summary) so a single oversized field can't push
+// (issue description, session summary, the fetched comment thread, the
+// fetched prior-activity history) so no single oversized component can push
 // the dispatch over Nomad's limit. The triggering message itself (the actual
 // instruction) is never capped here — see buildPrompt.
 const maxFieldBytes = 4000
+
+// ackThought is the boilerplate acknowledgement dispatch posts before kicking
+// off Nomad. buildPrompt filters it back out of the fetched activity history
+// — it carries no information and, being the newest activity at fetch time,
+// would otherwise sit redundantly right above the ## Request section.
+const ackThought = "Picking this up — spinning up an agent."
 
 // truncatedMarker prefixes any field clip had to cut down, so pi (and anyone
 // reading pi.jsonl) can tell the context it saw was partial.
@@ -588,7 +605,11 @@ func clip(s string, n int) string {
 // prompt-extraction fell through to a raw `tojson` of the (possibly
 // mid-string-truncated) whole webhook, which is what pi actually ran on —
 // unparseable JSON fragments instead of an instruction.
-func buildPrompt(ev agentSessionEvent) string {
+//
+// tc supplements the webhook with what fetchThreadContext pulled directly
+// from Linear: the issue's comment thread and this session's earlier
+// activity, both otherwise invisible to a single dispatch.
+func buildPrompt(ev agentSessionEvent, tc threadContext) string {
 	var b strings.Builder
 	if iss := ev.AgentSession.Issue; iss.Title != "" {
 		b.WriteString("# " + iss.Title)
@@ -606,10 +627,35 @@ func buildPrompt(ev agentSessionEvent) string {
 	if s := ev.AgentSession.Summary; s != "" {
 		b.WriteString("## Session summary\n" + clip(s, maxFieldBytes) + "\n\n")
 	}
-	if body := ev.triggerBody(); body != "" {
-		b.WriteString("## Request\n" + body)
+	if len(tc.comments) > 0 {
+		b.WriteString("## Issue comment thread\n" + clip(strings.Join(tc.comments, "\n\n"), maxFieldBytes) + "\n\n")
+	}
+	trigger := ev.triggerBody()
+	if activities := filterNoise(tc.activities, trigger); len(activities) > 0 {
+		b.WriteString("## Prior agent activity in this session\n" + clip(strings.Join(activities, "\n\n"), maxFieldBytes) + "\n\n")
+	}
+	if trigger != "" {
+		b.WriteString("## Request\n" + trigger)
 	}
 	return b.String()
+}
+
+// filterNoise drops activity lines that would be pure redundancy right above
+// buildPrompt's ## Request section: dispatch's own boilerplate ack thought,
+// and (on a re-dispatch) the very message that's already rendered verbatim as
+// the Request.
+func filterNoise(activities []string, trigger string) []string {
+	skip := map[string]bool{"Thought: " + ackThought: true}
+	if trigger != "" {
+		skip["Prompt: "+trigger] = true
+	}
+	out := make([]string, 0, len(activities))
+	for _, a := range activities {
+		if !skip[a] {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // trimToUTF8Boundary drops the first n bytes of s, nudged forward to the next
@@ -625,4 +671,139 @@ func trimToUTF8Boundary(s string, n int) string {
 		n++
 	}
 	return s[n:]
+}
+
+// threadContext is context fetched straight from Linear rather than carried
+// on the webhook: the issue's full comment thread and this agent session's
+// earlier activity (thoughts/actions/responses/prompts/errors from previous
+// dispatches). Both are oldest-first, matching every other field buildPrompt
+// draws from — clip keeps the tail (most recent) when a section runs over
+// budget.
+type threadContext struct {
+	comments   []string
+	activities []string
+}
+
+// threadContextQuery pulls exactly what buildPrompt needs and nothing more:
+// the session's activity connection and, through its issue, the comment
+// connection. Every content variant is a distinct GraphQL type (verified via
+// introspection against Linear's public schema), so each needs its own
+// inline fragment — there is no shared `body` field to select once.
+const threadContextQuery = `query($id: String!) {
+  agentSession(id: $id) {
+    activities(first: 100) {
+      nodes {
+        content {
+          __typename
+          ... on AgentActivityThoughtContent { body }
+          ... on AgentActivityActionContent { action }
+          ... on AgentActivityResponseContent { body }
+          ... on AgentActivityPromptContent { body }
+          ... on AgentActivityErrorContent { body }
+          ... on AgentActivityElicitationContent { body }
+        }
+      }
+    }
+    issue {
+      comments(first: 100) {
+        nodes { body user { name } }
+      }
+    }
+  }
+}`
+
+// fetchThreadContext queries Linear directly for sessionID's full comment
+// thread and prior session activity, using the receiver's own OAuth token —
+// the same one postActivity uses — rather than anything scoped down for the
+// dispatch. This is a plain HTTPS response, not a Nomad dispatch payload, so
+// none of maxDispatchPayload's 16KiB ceiling applies to the fetch itself;
+// only the prompt buildPrompt assembles from the result has to fit that
+// budget. A failure here is not fatal to the dispatch — see dispatchNomad —
+// since this is context the prompt is enriched with, not required to have.
+func (c *client) fetchThreadContext(ctx context.Context, token, sessionID string) (threadContext, error) {
+	payload := map[string]any{
+		"query":     threadContextQuery,
+		"variables": map[string]any{"id": sessionID},
+	}
+	buf, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, linearGraphQL, bytes.NewReader(buf))
+	if err != nil {
+		return threadContext{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return threadContext{}, err
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return threadContext{}, err
+	}
+	if resp.StatusCode != http.StatusOK || bytes.Contains(out, []byte(`"errors"`)) {
+		return threadContext{}, fmt.Errorf("graphql %d: %s", resp.StatusCode, out)
+	}
+	return parseThreadContext(out)
+}
+
+// parseThreadContext decodes fetchThreadContext's GraphQL response body into
+// a threadContext. Split out from fetchThreadContext so the decoding — the
+// part worth covering with a table of real response shapes — is testable
+// without a live Linear API call.
+func parseThreadContext(raw []byte) (threadContext, error) {
+	var parsed struct {
+		Data struct {
+			AgentSession struct {
+				Activities struct {
+					Nodes []struct {
+						Content struct {
+							Typename string `json:"__typename"`
+							Body     string `json:"body"`
+							Action   string `json:"action"`
+						} `json:"content"`
+					} `json:"nodes"`
+				} `json:"activities"`
+				Issue struct {
+					Comments struct {
+						Nodes []struct {
+							Body string `json:"body"`
+							User *struct {
+								Name string `json:"name"`
+							} `json:"user"`
+						} `json:"nodes"`
+					} `json:"comments"`
+				} `json:"issue"`
+			} `json:"agentSession"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return threadContext{}, fmt.Errorf("decode thread context: %w", err)
+	}
+
+	var tc threadContext
+	// Linear returns both connections newest-first; walk backwards so every
+	// slice buildPrompt sees is oldest-first, like every other field it draws
+	// from.
+	nodes := parsed.Data.AgentSession.Activities.Nodes
+	for i := len(nodes) - 1; i >= 0; i-- {
+		content := nodes[i].Content
+		label := strings.TrimSuffix(strings.TrimPrefix(content.Typename, "AgentActivity"), "Content")
+		switch {
+		case content.Body != "":
+			tc.activities = append(tc.activities, label+": "+content.Body)
+		case content.Action != "":
+			tc.activities = append(tc.activities, label+": "+content.Action)
+		}
+	}
+	comments := parsed.Data.AgentSession.Issue.Comments.Nodes
+	for i := len(comments) - 1; i >= 0; i-- {
+		who := "someone"
+		if u := comments[i].User; u != nil && u.Name != "" {
+			who = u.Name
+		}
+		tc.comments = append(tc.comments, who+": "+comments[i].Body)
+	}
+	return tc, nil
 }

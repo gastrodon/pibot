@@ -31,7 +31,7 @@ func TestBuildPromptIncludesIssueAndRequest(t *testing.T) {
 	ev.AgentSession.Issue.Description = "issue body"
 	ev.AgentSession.Comment.Body = "please do the thing"
 
-	got := buildPrompt(ev)
+	got := buildPrompt(ev, threadContext{})
 	for _, want := range []string{"Do the thing", "EVA-1", "https://linear.app/x/issue/EVA-1", "issue body", "please do the thing"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("buildPrompt output missing %q, got %q", want, got)
@@ -46,7 +46,7 @@ func TestBuildPromptCapsLongFieldsButNotTheRequest(t *testing.T) {
 	ev.AgentSession.Issue.Description = strings.Repeat("d", maxFieldBytes*2)
 	ev.AgentActivity.Content.Body = strings.Repeat("r", maxFieldBytes*2)
 
-	got := buildPrompt(ev)
+	got := buildPrompt(ev, threadContext{})
 	if !strings.Contains(got, truncatedMarker) {
 		t.Fatal("expected the oversized description to be capped")
 	}
@@ -56,8 +56,96 @@ func TestBuildPromptCapsLongFieldsButNotTheRequest(t *testing.T) {
 }
 
 func TestBuildPromptEmptyEvent(t *testing.T) {
-	if got := buildPrompt(agentSessionEvent{}); got != "" {
+	if got := buildPrompt(agentSessionEvent{}, threadContext{}); got != "" {
 		t.Fatalf("expected an empty prompt for an empty event, got %q", got)
+	}
+}
+
+func TestBuildPromptIncludesThreadContext(t *testing.T) {
+	var ev agentSessionEvent
+	ev.Action = "prompted"
+	ev.AgentActivity.Content.Body = "what's the status"
+	tc := threadContext{
+		comments:   []string{"alice: first comment", "bob: second comment"},
+		activities: []string{"Response: opened PR #14"},
+	}
+
+	got := buildPrompt(ev, tc)
+	for _, want := range []string{"## Issue comment thread", "first comment", "second comment", "## Prior agent activity in this session", "opened PR #14", "## Request\nwhat's the status"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("buildPrompt output missing %q, got %q", want, got)
+		}
+	}
+}
+
+func TestBuildPromptFiltersAckAndDuplicateTrigger(t *testing.T) {
+	var ev agentSessionEvent
+	ev.Action = "prompted"
+	ev.AgentActivity.Content.Body = "do more"
+	tc := threadContext{
+		activities: []string{
+			"Response: earlier work summary",
+			"Thought: " + ackThought,
+			"Prompt: do more",
+		},
+	}
+
+	got := buildPrompt(ev, tc)
+	if !strings.Contains(got, "earlier work summary") {
+		t.Fatal("expected real prior activity to survive filtering")
+	}
+	if strings.Contains(got, ackThought) {
+		t.Fatalf("expected the boilerplate ack thought to be filtered out, got %q", got)
+	}
+	if strings.Count(got, "do more") != 1 {
+		t.Fatalf("expected the triggering prompt to appear once (in ## Request), got %q", got)
+	}
+}
+
+func TestParseThreadContext(t *testing.T) {
+	raw := []byte(`{
+  "data": {
+    "agentSession": {
+      "activities": {
+        "nodes": [
+          {"content": {"__typename": "AgentActivityThoughtContent", "body": "newest thought"}},
+          {"content": {"__typename": "AgentActivityActionContent", "action": "ran a tool"}},
+          {"content": {"__typename": "AgentActivityResponseContent", "body": "oldest response"}}
+        ]
+      },
+      "issue": {
+        "comments": {
+          "nodes": [
+            {"body": "newest comment", "user": {"name": "alice"}},
+            {"body": "oldest comment", "user": null}
+          ]
+        }
+      }
+    }
+  }
+}`)
+
+	tc, err := parseThreadContext(raw)
+	if err != nil {
+		t.Fatalf("parseThreadContext: %v", err)
+	}
+	wantActivities := []string{"Response: oldest response", "Action: ran a tool", "Thought: newest thought"}
+	if len(tc.activities) != len(wantActivities) {
+		t.Fatalf("activities = %v, want %v", tc.activities, wantActivities)
+	}
+	for i, want := range wantActivities {
+		if tc.activities[i] != want {
+			t.Fatalf("activities[%d] = %q, want %q (order should be oldest-first)", i, tc.activities[i], want)
+		}
+	}
+	wantComments := []string{"someone: oldest comment", "alice: newest comment"}
+	if len(tc.comments) != len(wantComments) {
+		t.Fatalf("comments = %v, want %v", tc.comments, wantComments)
+	}
+	for i, want := range wantComments {
+		if tc.comments[i] != want {
+			t.Fatalf("comments[%d] = %q, want %q (order should be oldest-first)", i, tc.comments[i], want)
+		}
 	}
 }
 
