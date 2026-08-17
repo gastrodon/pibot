@@ -109,15 +109,29 @@ func splitNonEmpty(s, sep string) []string {
 	return out
 }
 
-// agentSessionEvent is the subset of the Linear webhook we act on.
+// agentSessionEvent is the subset of the Linear webhook we act on. Field
+// shapes are verified against Linear's public GraphQL schema (the webhook
+// body mirrors AgentSession/Issue/Comment) rather than assumed — notably,
+// there is no promptContext field anywhere on AgentSession; the actual
+// thread context lives in agentSession.context (an opaque JSON blob with no
+// documented shape), and the fields worth building a prompt from are
+// agentSession.issue.{title,description}, agentSession.summary, and the
+// single triggering message (see triggerBody).
 type agentSessionEvent struct {
 	Type         string `json:"type"`
 	Action       string `json:"action"`
 	AgentSession struct {
 		ID      string `json:"id"`
+		Summary string `json:"summary"`
 		Comment struct {
 			Body string `json:"body"`
 		} `json:"comment"`
+		Issue struct {
+			Identifier  string `json:"identifier"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			URL         string `json:"url"`
+		} `json:"issue"`
 	} `json:"agentSession"`
 	AgentActivity struct {
 		Content struct {
@@ -128,8 +142,7 @@ type agentSessionEvent struct {
 
 // triggerBody returns the single message that triggered this event — the
 // initiating comment on `created`, the latest prompt on `prompted` — never
-// the accreted promptContext thread history. Directives are parsed only from
-// this field, so they're unaffected by shrinkPayload's truncation.
+// the accreted thread history. Directives are parsed only from this field.
 func (ev agentSessionEvent) triggerBody() string {
 	switch ev.Action {
 	case "created":
@@ -290,7 +303,7 @@ func (c *client) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if ev.Type != "AgentSessionEvent" || ev.AgentSession.ID == "" {
 		return
 	}
-	go c.dispatch(ev, body)
+	go c.dispatch(ev)
 }
 
 // verify checks the Linear-Signature header: hex(HMAC-SHA256(rawBody, secret)).
@@ -306,7 +319,7 @@ func (c *client) verify(sig string, body []byte) bool {
 
 // dispatch posts the thought ack, then dispatches the Nomad job; on dispatch
 // failure it surfaces an error activity back to the session.
-func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
+func (c *client) dispatch(ev agentSessionEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -323,7 +336,7 @@ func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
 		return
 	}
 
-	if err := c.dispatchNomad(ctx, ev, raw, model, thinking); err != nil {
+	if err := c.dispatchNomad(ctx, ev, model, thinking); err != nil {
 		log.Printf("nomad dispatch failed for session %s: %v", ev.AgentSession.ID, err)
 		msg := fmt.Sprintf("Couldn't start the agent job: %v", err)
 		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
@@ -484,10 +497,10 @@ func (c *client) refreshLocked(ctx context.Context) error {
 	return nil
 }
 
-// dispatchNomad kicks the parameterized batch job, passing the (possibly
-// shrunk, see shrinkPayload) webhook as the dispatch payload and the session
-// id as dispatch meta.
-func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []byte, model, thinking string) error {
+// dispatchNomad kicks the parameterized batch job, passing a curated prompt
+// (see buildPrompt) as the dispatch payload and the session id as dispatch
+// meta.
+func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model, thinking string) error {
 	// The receiver is the sole owner of the refresh token; hand the job only a
 	// short-lived access token (no refresh material) so it can post one response
 	// activity without a second refresher rotating tokens out from under us.
@@ -495,9 +508,17 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []
 	if err != nil {
 		return fmt.Errorf("get access token for dispatch: %w", err)
 	}
-	payload := shrinkPayload(raw)
-	if len(payload) != len(raw) {
-		log.Printf("session %s: webhook payload %d bytes exceeds Nomad's dispatch limit, shrunk to %d", ev.AgentSession.ID, len(raw), len(payload))
+	payload, err := json.Marshal(map[string]string{"prompt": buildPrompt(ev)})
+	if err != nil {
+		return fmt.Errorf("marshal dispatch payload: %w", err)
+	}
+	if len(payload) > maxDispatchPayload {
+		// Defensive only: buildPrompt already caps every field it draws from, so
+		// this should be unreachable outside pathological input. Nomad hard-rejects
+		// anything over 16KiB, so never send a dispatch un-capped regardless.
+		prompt := clip(buildPrompt(ev), maxDispatchPayload-256)
+		payload, _ = json.Marshal(map[string]string{"prompt": prompt})
+		log.Printf("session %s: dispatch prompt %d bytes exceeded Nomad's %d-byte limit even after field caps, hard-truncated", ev.AgentSession.ID, len(payload), maxDispatchPayload)
 	}
 	body := map[string]any{
 		"Payload": base64.StdEncoding.EncodeToString(payload),
@@ -534,132 +555,61 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []
 
 // maxDispatchPayload leaves headroom under Nomad's hard-coded 16384-byte
 // dispatch payload limit (DispatchPayloadSizeLimit in nomad/job_endpoint.go —
-// not a server setting, so we can't raise it). Linear's AgentSessionEvent
-// webhook grows with the thread (promptContext embeds the issue + comment
-// history), so long-running threads regularly exceed it and Nomad rejects the
-// dispatch outright with "Payload exceeds maximum size" — pibot never even
-// starts. shrinkPayload keeps that from happening.
+// not a server setting, so we can't raise it).
 const maxDispatchPayload = 15 * 1024
 
-// truncatedMarker prefixes any string field shrinkPayload had to cut down, so
-// pi (and anyone reading pi.jsonl) can tell the context it saw was partial.
-const truncatedMarker = "…[truncated by pibot: original context exceeded Nomad's dispatch size limit]…"
+// maxFieldBytes bounds any single context component buildPrompt draws from
+// (issue description, session summary) so a single oversized field can't push
+// the dispatch over Nomad's limit. The triggering message itself (the actual
+// instruction) is never capped here — see buildPrompt.
+const maxFieldBytes = 4000
 
-// shrinkPayload returns raw unchanged if it already fits under
-// maxDispatchPayload. Otherwise it walks the top-level webhook object (and one
-// level of nesting, to reach fields like agentSession.promptContext) for
-// string values and truncates the largest one(s) — keeping each string's tail,
-// since Linear assembles context oldest-first, so the newest/most relevant
-// text survives — until the whole payload fits. If the body isn't a JSON
-// object (unexpected shape), it falls back to a byte-safe hard truncation
-// wrapped in a minimal JSON envelope, so a dispatch never fails outright just
-// because we can't parse it.
-func shrinkPayload(raw []byte) []byte {
-	if len(raw) <= maxDispatchPayload {
-		return raw
+// truncatedMarker prefixes any field clip had to cut down, so pi (and anyone
+// reading pi.jsonl) can tell the context it saw was partial.
+const truncatedMarker = "…[truncated by pibot: content exceeded the dispatch size budget]…"
+
+// clip truncates s to at most n bytes, keeping the tail — Linear (and most
+// threaded UIs) assembles context oldest-first, so the newest/most relevant
+// text survives a cut. A no-op if s already fits.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &top); err != nil {
-		return fallbackTruncate(raw)
-	}
-
-	fields := collectStringFields(top)
-	for range fields {
-		out, err := json.Marshal(top)
-		if err != nil {
-			return fallbackTruncate(raw)
-		}
-		if len(out) <= maxDispatchPayload {
-			return out
-		}
-
-		// Shrink whichever field is currently largest; re-evaluate each pass
-		// since truncating one field changes the overall size.
-		largest := largestField(fields)
-		if largest == nil || len(largest.value) < 200 {
-			break // nothing left worth cutting
-		}
-		over := len(out) - maxDispatchPayload
-		cut := over + over/4 + len(truncatedMarker) // trim extra so we converge, not loop
-		if cut >= len(largest.value) {
-			largest.set("")
-			continue
-		}
-		largest.set(truncatedMarker + trimToUTF8Boundary(largest.value, cut))
-	}
-
-	out, err := json.Marshal(top)
-	if err != nil || len(out) > maxDispatchPayload {
-		return fallbackTruncate(raw)
-	}
-	return out
+	return truncatedMarker + trimToUTF8Boundary(s, len(s)-n)
 }
 
-// stringField is a mutable handle on one JSON string value somewhere in the
-// (at most 2-level-deep) webhook object.
-type stringField struct {
-	value string
-	set   func(string)
-}
-
-// collectStringFields gathers every top-level string field plus, for every
-// top-level object field, its immediate string sub-fields — covering both
-// `.promptContext` and `.agentSession.promptContext`-shaped payloads without
-// needing to know Linear's exact webhook schema.
-func collectStringFields(top map[string]json.RawMessage) []*stringField {
-	var fields []*stringField
-
-	addFrom := func(obj map[string]json.RawMessage, flush func()) {
-		for k, v := range obj {
-			if len(v) < 2 || v[0] != '"' {
-				continue
-			}
-			var s string
-			if json.Unmarshal(v, &s) != nil {
-				continue
-			}
-			k := k
-			f := &stringField{value: s}
-			f.set = func(ns string) {
-				f.value = ns
-				nb, _ := json.Marshal(ns)
-				obj[k] = nb
-				if flush != nil {
-					flush()
-				}
-			}
-			fields = append(fields, f)
+// buildPrompt assembles the text pi actually runs on from the fields the
+// receiver knows exist on Linear's AgentSessionEvent webhook —
+// agentSession.issue.{title,description}, agentSession.summary, and the
+// single triggering message (see triggerBody) — instead of forwarding
+// Linear's full webhook body and hoping the worker can find a promptContext
+// field in it. It can't: Linear's AgentSession GraphQL type, which the
+// webhook mirrors, has no such field. Previously that meant every dispatch's
+// prompt-extraction fell through to a raw `tojson` of the (possibly
+// mid-string-truncated) whole webhook, which is what pi actually ran on —
+// unparseable JSON fragments instead of an instruction.
+func buildPrompt(ev agentSessionEvent) string {
+	var b strings.Builder
+	if iss := ev.AgentSession.Issue; iss.Title != "" {
+		b.WriteString("# " + iss.Title)
+		if iss.Identifier != "" {
+			b.WriteString(" (" + iss.Identifier + ")")
+		}
+		b.WriteString("\n\n")
+		if iss.URL != "" {
+			b.WriteString(iss.URL + "\n\n")
+		}
+		if iss.Description != "" {
+			b.WriteString(clip(iss.Description, maxFieldBytes) + "\n\n")
 		}
 	}
-
-	addFrom(top, nil)
-	for k, v := range top {
-		if len(v) < 2 || v[0] != '{' {
-			continue
-		}
-		var nested map[string]json.RawMessage
-		if json.Unmarshal(v, &nested) != nil {
-			continue
-		}
-		k := k
-		addFrom(nested, func() {
-			nb, _ := json.Marshal(nested)
-			top[k] = nb
-		})
+	if s := ev.AgentSession.Summary; s != "" {
+		b.WriteString("## Session summary\n" + clip(s, maxFieldBytes) + "\n\n")
 	}
-	return fields
-}
-
-// largestField returns the field currently holding the most bytes.
-func largestField(fields []*stringField) *stringField {
-	var largest *stringField
-	for _, f := range fields {
-		if largest == nil || len(f.value) > len(largest.value) {
-			largest = f
-		}
+	if body := ev.triggerBody(); body != "" {
+		b.WriteString("## Request\n" + body)
 	}
-	return largest
+	return b.String()
 }
 
 // trimToUTF8Boundary drops the first n bytes of s, nudged forward to the next
@@ -675,29 +625,4 @@ func trimToUTF8Boundary(s string, n int) string {
 		n++
 	}
 	return s[n:]
-}
-
-// fallbackTruncate handles payloads shrinkPayload couldn't safely parse as a
-// JSON object: hard-truncate the raw bytes to a UTF-8-safe boundary and wrap
-// them as a single JSON string field, so the dispatch still carries something
-// under the size limit instead of failing outright.
-func fallbackTruncate(raw []byte) []byte {
-	const envelope = `{"promptContext":""}` // fixed overhead around the string value
-	budget := maxDispatchPayload - len(envelope) - len(truncatedMarker) - 16
-	if budget < 0 {
-		budget = 0
-	}
-	s := trimToUTF8Boundary(string(raw), len(raw)-budget)
-	for {
-		out, err := json.Marshal(map[string]string{"promptContext": truncatedMarker + s})
-		if err != nil {
-			return []byte(`{"promptContext":""}`)
-		}
-		if len(out) <= maxDispatchPayload || s == "" {
-			return out
-		}
-		// Escaping (quotes, control chars) can inflate the marshaled size beyond
-		// our estimate; back off further until it actually fits.
-		s = trimToUTF8Boundary(s, len(out)-maxDispatchPayload+16)
-	}
 }

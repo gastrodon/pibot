@@ -9,6 +9,15 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   webhooks. Verifies the HMAC signature, acks the session with a `thought`
   activity, and dispatches a parameterized Nomad batch job to run the actual
   agent in isolation. Refreshes its own Linear OAuth access token in place.
+  It also builds the dispatch payload itself, rather than forwarding Linear's
+  raw webhook body: the issue title/description, session summary, and the
+  single triggering message get assembled into one `prompt` field (see
+  `buildPrompt`), so the worker always runs on a coherent instruction instead
+  of trying to guess a field name out of the webhook's actual shape (which
+  has no `promptContext` field — verified against Linear's public GraphQL
+  schema) or, worse, the entire raw JSON body. Any one field that's still too
+  long to fit Nomad's 16KiB dispatch limit is capped with its tail kept
+  (`clip`); the triggering message itself is never capped.
 - **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
   refresh token.
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as
@@ -28,8 +37,7 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   no SSH key, so a build touching those inputs will fail to fetch them until
   that's resolved.
 - **`module/pi-agent-system-prompt.md`** — the worker's operating manual, baked
-  into the runtime image and passed as `--append-system-prompt`. Linear's
-  workspace/team agent guidance is appended per-dispatch.
+  into the runtime image and passed as `--append-system-prompt`.
 
 ## Secrets
 

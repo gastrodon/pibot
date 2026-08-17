@@ -1,110 +1,64 @@
 package main
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
 
-func TestShrinkPayloadNoop(t *testing.T) {
-	raw := []byte(`{"type":"AgentSessionEvent","action":"created","agentSession":{"id":"abc"}}`)
-	got := shrinkPayload(raw)
-	if string(got) != string(raw) {
-		t.Fatalf("expected payload under the limit to pass through unchanged, got %q", got)
+func TestClipNoop(t *testing.T) {
+	if got := clip("short", 100); got != "short" {
+		t.Fatalf("clip should pass short strings through unchanged, got %q", got)
 	}
 }
 
-func TestShrinkPayloadTopLevelField(t *testing.T) {
-	big := strings.Repeat("x", 20*1024)
-	raw, err := json.Marshal(map[string]any{
-		"type":          "AgentSessionEvent",
-		"action":        "created",
-		"promptContext": "keep-the-tail:" + big,
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestClipKeepsTail(t *testing.T) {
+	big := strings.Repeat("x", 100) + "tail-end"
+	got := clip(big, 20)
+	if !strings.Contains(got, truncatedMarker) {
+		t.Fatalf("expected truncation marker, got %q", got)
 	}
-	if len(raw) <= maxDispatchPayload {
-		t.Fatalf("test fixture should exceed the limit, got %d bytes", len(raw))
-	}
-
-	got := shrinkPayload(raw)
-	if len(got) > maxDispatchPayload {
-		t.Fatalf("shrunk payload still exceeds limit: %d > %d", len(got), maxDispatchPayload)
-	}
-
-	var out map[string]any
-	if err := json.Unmarshal(got, &out); err != nil {
-		t.Fatalf("shrunk payload isn't valid JSON: %v", err)
-	}
-	if out["type"] != "AgentSessionEvent" {
-		t.Fatalf("expected non-truncated small fields to survive, got %v", out["type"])
-	}
-	pc, _ := out["promptContext"].(string)
-	if !strings.Contains(pc, truncatedMarker) {
-		t.Fatalf("expected truncation marker in shrunk field, got len %d", len(pc))
-	}
-	if !strings.HasSuffix(pc, "xxxx") {
-		t.Fatalf("expected the tail of the original string to survive, got suffix %q", pc[max(0, len(pc)-20):])
+	if !strings.HasSuffix(got, "tail-end") {
+		t.Fatalf("expected the tail of the original string to survive, got %q", got)
 	}
 }
 
-func TestShrinkPayloadNestedField(t *testing.T) {
-	big := strings.Repeat("y", 20*1024)
-	raw, err := json.Marshal(map[string]any{
-		"type":   "AgentSessionEvent",
-		"action": "created",
-		"agentSession": map[string]any{
-			"id":            "abc",
-			"promptContext": big,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestBuildPromptIncludesIssueAndRequest(t *testing.T) {
+	var ev agentSessionEvent
+	ev.Action = "created"
+	ev.AgentSession.Issue.Identifier = "EVA-1"
+	ev.AgentSession.Issue.Title = "Do the thing"
+	ev.AgentSession.Issue.URL = "https://linear.app/x/issue/EVA-1"
+	ev.AgentSession.Issue.Description = "issue body"
+	ev.AgentSession.Comment.Body = "please do the thing"
 
-	got := shrinkPayload(raw)
-	if len(got) > maxDispatchPayload {
-		t.Fatalf("shrunk payload still exceeds limit: %d > %d", len(got), maxDispatchPayload)
-	}
-
-	var out struct {
-		AgentSession struct {
-			ID            string `json:"id"`
-			PromptContext string `json:"promptContext"`
-		} `json:"agentSession"`
-	}
-	if err := json.Unmarshal(got, &out); err != nil {
-		t.Fatalf("shrunk payload isn't valid JSON: %v", err)
-	}
-	if out.AgentSession.ID != "abc" {
-		t.Fatalf("expected nested non-truncated fields to survive, got %q", out.AgentSession.ID)
-	}
-	if !strings.Contains(out.AgentSession.PromptContext, truncatedMarker) {
-		t.Fatal("expected truncation marker in shrunk nested field")
+	got := buildPrompt(ev)
+	for _, want := range []string{"Do the thing", "EVA-1", "https://linear.app/x/issue/EVA-1", "issue body", "please do the thing"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("buildPrompt output missing %q, got %q", want, got)
+		}
 	}
 }
 
-func TestShrinkPayloadNonObjectFallsBack(t *testing.T) {
-	raw := []byte(`"` + strings.Repeat("z", 20*1024) + `"`)
-	got := shrinkPayload(raw)
-	if len(got) > maxDispatchPayload {
-		t.Fatalf("fallback payload still exceeds limit: %d > %d", len(got), maxDispatchPayload)
+func TestBuildPromptCapsLongFieldsButNotTheRequest(t *testing.T) {
+	var ev agentSessionEvent
+	ev.Action = "prompted"
+	ev.AgentSession.Issue.Title = "x"
+	ev.AgentSession.Issue.Description = strings.Repeat("d", maxFieldBytes*2)
+	ev.AgentActivity.Content.Body = strings.Repeat("r", maxFieldBytes*2)
+
+	got := buildPrompt(ev)
+	if !strings.Contains(got, truncatedMarker) {
+		t.Fatal("expected the oversized description to be capped")
 	}
-	var out map[string]string
-	if err := json.Unmarshal(got, &out); err != nil {
-		t.Fatalf("fallback payload isn't valid JSON: %v", err)
-	}
-	if _, ok := out["promptContext"]; !ok {
-		t.Fatal("expected fallback envelope to carry a promptContext field")
+	if !strings.Contains(got, strings.Repeat("r", maxFieldBytes*2)) {
+		t.Fatal("expected the triggering request body to survive uncapped")
 	}
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
+func TestBuildPromptEmptyEvent(t *testing.T) {
+	if got := buildPrompt(agentSessionEvent{}); got != "" {
+		t.Fatalf("expected an empty prompt for an empty event, got %q", got)
 	}
-	return b
 }
 
 func TestParseDirective(t *testing.T) {
