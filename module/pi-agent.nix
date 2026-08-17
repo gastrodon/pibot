@@ -315,7 +315,7 @@ let
         exec 3>"$fifo"
         printf '{"type":"prompt","message":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)" >&3
 
-        # Wait for the session to settle, bounded by a 30m deadline.
+        # Wait for the session to settle, bounded by the configured deadline.
         #
         # The sentinel MUST be agent_settled, not agent_end. agent_end fires once per
         # *low-level* agent run and is explicitly "may still be followed by retry,
@@ -324,8 +324,7 @@ let
         # about to resume the run. Breaking on the first agent_end therefore killed pi
         # mid-flight on any retried session: the work was left half-done, and because
         # the turns up to that point are typically thinking+toolCall with no text block,
-        # the reply came out empty and Linear got the "pi completed without a text
-        # response." fallback. agent_settled is the terminal event — no retry,
+        # the reply came out empty. agent_settled is the terminal event — no retry,
         # compaction retry, or queued continuation remains. (Added upstream in 0.80.4;
         # this image pins 0.84.1, so it is always emitted.)
         #
