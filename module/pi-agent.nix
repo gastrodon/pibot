@@ -184,20 +184,98 @@ let
           export LINEAR_ACCESS_TOKEN="$NOMAD_META_access_token"
         fi
 
-        # Extract the prompt from the raw webhook. The exact field is unconfirmed
-        # (Go passes the payload through unparsed) — try promptContext, then the
-        # nested form, then fall back to the whole payload so we never send empty.
-        # jq -r prints a string bare and an object as compact JSON; .a.b is null-safe.
+        # post <activity-type> <body-file> — one agentActivityCreate. jq --rawfile
+        # reads the body as a string var, so pi's output (quotes/newlines/
+        # backslashes) is correctly JSON-escaped; shell string-building would
+        # produce invalid JSON.
+        post() {
+          jq -n \
+            --rawfile body "$2" \
+            --arg session "$NOMAD_META_session_id" \
+            --arg act "$1" \
+            '{query:"mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }",variables:{input:{agentSessionId:$session,content:{type:$act,body:$body}}}}' \
+            > /local/req.json
+          curl -sS -X POST https://api.linear.app/graphql \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NOMAD_META_access_token" \
+            --data @/local/req.json
+        }
+
+        # fail <message> — surface a worker-side failure as a Linear `error`
+        # activity and stop. Anything that stops pi from running at all belongs
+        # here: the thread must never be left guessing why nothing happened.
+        fail() {
+          {
+            printf '%s\n\n' "$1"
+            printf 'worker: node=%s alloc=%s\n' "''${NOMAD_NODE_NAME:-unknown}" "''${NOMAD_ALLOC_ID:-unknown}"
+          } > /local/pi-out.txt
+          post error /local/pi-out.txt
+          exit 1
+        }
+
+        # Provider credentials. auth.json lives on the persistent volume and pi
+        # rewrites it as tokens rotate, so only ever seed a *missing* one — never
+        # clobber a live token with the (older) copy from the credential mount.
         #
-        # jq's // only falls through on null/false, NOT on an empty string — and
-        # Linear sends promptContext: "" (present but empty) for sessions started
-        # without a triggering comment, e.g. agentSessionCreateOnIssue against a
-        # freshly-created issue. Undetected, that sent pi a blank prompt: it settled
-        # immediately with no text response and did none of the requested work.
-        # `useful` treats "" the same as null so the fallback chain actually runs.
+        # An unseeded node is the failure this guards. pi answers the prompt with
+        # {"command":"prompt","success":false,"error":"No API key found for the
+        # selected model"} and then sits idle — RPC mode keeps the process alive
+        # while stdin is open, so nothing else is ever written to pi.jsonl and the
+        # run is killed at the deadline below having produced no text and run no
+        # tools. Every node the job can be placed on needs credentials, and a node
+        # that lacks them has to say so rather than burn 30 minutes in silence.
+        auth="$HOME/.pi/agent/auth.json"
+        authed() { [ -s "$auth" ] && [ "$(jq -r 'keys | length' "$auth" 2>/dev/null || echo 0)" != "0" ]; }
+        if ! authed && [ -s /run/pi-auth ]; then
+          install -m 0600 /run/pi-auth "$auth"
+          echo "seeded $auth from the worker credential mount" >&2
+        fi
+        # Message lines are printf arguments, not a multi-line shell string: the
+        # script body is indented, and indented lines would reach Linear as a
+        # markdown code block.
+        if ! authed; then
+          fail "$(printf '%s\n' \
+            "This worker has no provider credentials, so pi could not have run." \
+            "" \
+            "$auth on this node is missing or empty, and nothing was mounted at /run/pi-auth to seed it from. Point services.piAgent.authFile at the credentials and re-dispatch — every node the pi-agent job can be placed on needs them.")"
+        fi
+
+        # Extract the prompt from the raw webhook. Linear's AgentSessionEvent is
+        # not part of its public GraphQL schema, so these are webhook-only fields
+        # — confirmed against captured payloads, not introspection:
+        #
+        #   action=created  -> top-level .promptContext, a ready-made XML context
+        #                      blob (issue, sub-issues, the triggering comment
+        #                      thread). Exactly what pi should be prompted with.
+        #   action=prompted -> no .promptContext at all. The human's message is at
+        #                      .agentActivity.content.body and the issue it belongs
+        #                      to at .agentSession.issue, so assemble the same shape.
+        #
+        # There is no .agentSession.promptContext, and a bare tojson is not a
+        # prompt: every follow-up ("@pibot do X" in an open session) reached pi as
+        # the raw webhook JSON, leaving it to infer the request from a dump of its
+        # own dispatch envelope. tojson stays only as a last-ditch fallback for a
+        # shape we have never seen, so a dispatch still carries something.
+        #
+        # `blank` treats whitespace-only the same as null: jq's // only falls
+        # through on null/false, so a present-but-empty field would otherwise win.
         prompt=$(jq -r '
-          def useful: if . == null then null elif (type == "string" and length == 0) then null else . end;
-          (.promptContext | useful) // (.agentSession.promptContext | useful) // tojson
+          def blank: . == null or (type == "string" and (gsub("\\s+"; "") | length) == 0);
+          def clean: if blank then null else . end;
+          def request: (.agentActivity.content.body | clean) // (.agentSession.comment.body | clean);
+          def issue_block:
+            (.agentSession.issue // {}) as $i
+            | [ "<issue identifier=\"\($i.identifier // "unknown")\">",
+                "<title>\($i.title // "")</title>",
+                "<description>\($i.description // "")</description>",
+                "<url>\($i.url // "")</url>",
+                "</issue>" ] | join("\n");
+          (.promptContext | clean) as $ctx
+          | request as $req
+          | if $ctx != null then $ctx
+            elif $req != null then issue_block + "\n\n<request>\n" + $req + "\n</request>"
+            else tojson
+            end
         ' /local/webhook.json)
 
         model_args=""
@@ -250,9 +328,23 @@ let
         # response." fallback. agent_settled is the terminal event — no retry,
         # compaction retry, or queued continuation remains. (Added upstream in 0.80.4;
         # this image pins 0.84.1, so it is always emitted.)
-        deadline=$(( $(date +%s) + 1800 ))
+        #
+        # The loop also watches for a rejected prompt. pi acks every prompt with a
+        # {"type":"response","command":"prompt"} event as its very first line, and
+        # success:false means the run never started (bad credentials, unresolvable
+        # model). pi stays alive afterwards waiting for more stdin, so without this
+        # check a rejection is indistinguishable from a slow run and burns the full
+        # deadline. Only the first line is inspected, so this stays cheap as
+        # pi.jsonl grows.
+        settled=0
+        rejected=""
+        deadline=$(( $(date +%s) + ${toString cfg.timeoutSeconds} ))
         while kill -0 "$pipid" 2>/dev/null; do
-          if grep -q '"type":"agent_settled"' /local/pi.jsonl 2>/dev/null; then break; fi
+          if grep -q '"type":"agent_settled"' /local/pi.jsonl 2>/dev/null; then settled=1; break; fi
+          rejected=$(head -n 1 /local/pi.jsonl 2>/dev/null \
+            | jq -r 'select(.type == "response" and .command == "prompt" and .success == false)
+                     | .error // "prompt rejected"' 2>/dev/null || true)
+          if [ -n "$rejected" ]; then break; fi
           if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
           sleep 2
         done
@@ -282,34 +374,48 @@ let
           | tail -n 1 > /local/pi-last.json || true
         jq -r '.' /local/pi-last.json > /local/pi-out.txt 2>/dev/null || : > /local/pi-out.txt
 
+        if [ -n "$rejected" ]; then
+          fail "$(printf '%s\n\n%s\n' "pi rejected the prompt and never started a run:" "$rejected")"
+        fi
+
+        # Report the outcome. A run that produced no text is a *failure* and is
+        # posted as one, carrying whatever evidence exists — this used to post a
+        # bare "pi completed without a text response." as a normal `response`,
+        # which reads like a benign result and hid hard failures (an unseeded node,
+        # a run guillotined mid-flight) behind identical, undiagnosable text.
         if [ "$rc" -ne 0 ]; then
           act=error
-          { echo "pi exited nonzero (rc=$rc):"; tail -n 40 /local/pi-err.txt; } > /local/pi-out.txt
+          { echo "pi exited nonzero (rc=$rc):"; echo; tail -n 40 /local/pi-err.txt; } > /local/pi-out.txt
         elif [ ! -s /local/pi-out.txt ]; then
-          # Never post an empty comment: fall back to a tool-run summary so the Linear
-          # thread always carries signal about what pi did.
-          act=response
-          { echo "pi completed without a text response.";
-            tools=$(jq -r 'select(.type=="tool_execution_start") | .toolName' /local/pi.jsonl 2>/dev/null | sort | uniq -c);
+          act=error
+          {
+            if [ "$settled" = 1 ]; then
+              echo "pi settled without producing a text response."
+            else
+              echo "pi produced no text response and was stopped at the ${toString cfg.timeoutSeconds}s deadline without settling."
+            fi
+            printf '\nworker: node=%s alloc=%s\n' "''${NOMAD_NODE_NAME:-unknown}" "''${NOMAD_ALLOC_ID:-unknown}"
+            tools=$(jq -r 'select(.type=="tool_execution_start") | .toolName' /local/pi.jsonl 2>/dev/null | sort | uniq -c)
             if [ -n "$tools" ]; then echo; echo "tools run:"; echo "$tools"; fi
+            echo; echo "last events:"
+            tail -n 5 /local/pi.jsonl 2>/dev/null | cut -c1-400
+            if [ -s /local/pi-err.txt ]; then echo; echo "stderr:"; tail -n 20 /local/pi-err.txt; fi
           } > /local/pi-out.txt
+        elif [ "$settled" != 1 ]; then
+          # There is text, but pi was still going when the deadline cut it off, so
+          # the answer may be mid-thought. Post it — it is the best signal we have
+          # — and say plainly that it was truncated.
+          act=response
+          {
+            cat /local/pi-out.txt
+            printf '\n\n---\n_pibot: this run hit the ${toString cfg.timeoutSeconds}s deadline and was stopped before pi finished, so the above may be incomplete._\n'
+          } > /local/pi-final.txt
+          mv /local/pi-final.txt /local/pi-out.txt
         else
           act=response
         fi
 
-        # Build the GraphQL body with jq so pi's output (quotes/newlines/backslashes)
-        # is correctly JSON-escaped — shell string-building would produce invalid JSON.
-        # --rawfile reads pi-out.txt as a string var, so the body is escaped safely.
-        jq -n \
-          --rawfile body /local/pi-out.txt \
-          --arg session "$NOMAD_META_session_id" \
-          --arg act "$act" \
-          '{query:"mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }",variables:{input:{agentSessionId:$session,content:{type:$act,body:$body}}}}' \
-          > /local/req.json
-        curl -sS -X POST https://api.linear.app/graphql \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer $NOMAD_META_access_token" \
-          --data @/local/req.json
+        post "$act" /local/pi-out.txt
   '';
 
   # Ship the script as a file in piPkg and run it, rather than inlining it as the
@@ -363,7 +469,15 @@ let
                   "${piPkg}:/opt/pi:ro"
                   "/var/lib/pi-agent/home:/root/.pi/agent"
                   "${cfg.githubPatFile}:/run/github-pat:ro"
-                ];
+                ]
+                ++ lib.optional (cfg.authFile != null) "${cfg.authFile}:/run/pi-auth:ro";
+              };
+              # Nomad interpolates ${...} in job-spec fields, so this resolves per
+              # dispatch: the entrypoint can name the node it ran on in every
+              # failure it reports, which is what turns "some dispatches do
+              # nothing" into "this node does nothing".
+              Env = {
+                NOMAD_NODE_NAME = "\${node.unique.name}";
               };
               Resources = {
                 CPU = 1000;
@@ -386,6 +500,33 @@ in
     githubPatFile = lib.mkOption {
       type = lib.types.path;
       description = "Path to a file containing a GitHub PAT for the worker's clone/push + PR creation.";
+    };
+
+    authFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to a file holding pi's `auth.json` (the provider credentials the
+        worker runs on), bind-mounted into the task and copied onto the
+        persistent volume the first time a node comes up without credentials.
+
+        The volume copy stays authoritative once it exists — pi rewrites it as
+        tokens rotate, and seeding never clobbers it. This option only answers
+        "what does a brand-new worker node start from", so growing the pool is a
+        deploy rather than a manual login on each box. A node with neither a
+        seeded volume nor this option fails its dispatches loudly instead of
+        idling until the deadline.
+      '';
+    };
+
+    timeoutSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 1800;
+      description = ''
+        How long a single dispatched session may run before the worker stops pi
+        and reports back. A session that hits this is cut off mid-flight, so
+        whatever pi had said by then is posted, explicitly marked incomplete.
+      '';
     };
 
     nomadBootstrapTokenFile = lib.mkOption {
