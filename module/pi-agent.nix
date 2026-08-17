@@ -447,12 +447,25 @@ let
         {
           Name = "pi";
           Count = 1;
-          # Pin to the server boxes — only they carry piPkg's store path and the
-          # /var/lib/pi-agent/home auth volume (rpi clients are arm64 and lack both).
+          # Pin to nodes that opt in via meta.pi_worker — they are the ones
+          # carrying piPkg's store path and the /var/lib/pi-agent/home auth volume.
+          #
+          # The architecture constraint is not redundant with it. Everything this
+          # task runs is x86_64: the pi release tarball is a Bun single-exec built
+          # for linux-x64, and piImage is a buildLayeredImage from an x86_64
+          # closure. On an arm64 client (the rpi) the image would load and the
+          # binary would die on exec, so an accidental meta.pi_worker there would
+          # turn every dispatch it won into a confusing failure. Say what the job
+          # actually requires instead of relying on nobody setting the flag wrong.
           Constraints = [
             {
               LTarget = "\${meta.pi_worker}";
               RTarget = "true";
+              Operand = "=";
+            }
+            {
+              LTarget = "\${attr.cpu.arch}";
+              RTarget = "amd64";
               Operand = "=";
             }
           ];
