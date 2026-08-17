@@ -40,7 +40,7 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 This repo owns **no secrets**. Every module option that needs one is a
 `*File` path (`webhookSecretFile`, `refreshTokenFile`, `clientIdFile`,
 `clientSecretFile`, `nomadTokenFile`, `githubPatFile`,
-`nomadBootstrapTokenFile`) — `config.go` reads `<KEY>_FILE` in preference to a
+`nomadBootstrapTokenFile`, `authFile`) — `config.go` reads `<KEY>_FILE` in preference to a
 bare `<KEY>` env var. The consuming flake is responsible for decrypting
 secret material and handing over paths, e.g. sops-nix's
 `config.sops.secrets.<name>.path`.
@@ -71,6 +71,7 @@ Add this flake as an input and import the modules you need:
             enable = true;
             githubPatFile = /* ... */;
             nomadBootstrapTokenFile = /* ... */;
+            authFile = /* ... */;
           };
         }
       ];
@@ -82,6 +83,14 @@ Add this flake as an input and import the modules you need:
 `services.piAgent` expects a Nomad client with `meta.pi_worker = "true"` (see
 the `pi_worker` constraint in `module/pi-agent.nix`) and a persistent
 `/var/lib/pi-agent/home` volume for `pi`'s auth state.
+
+**Every node carrying that meta needs credentials.** The job is placed on any
+of them, so one unseeded node silently swallows a share of all dispatches:
+`pi` rejects the prompt, then idles until the run is killed at
+`timeoutSeconds`. Set `authFile` and a new node seeds itself on its first
+dispatch (the volume copy wins ever after, since `pi` rotates it); leave it
+unset and such a node reports the problem on the Linear thread instead of
+failing quietly.
 
 By default the worker routes to Anthropic (`claude-sonnet-5`, high thinking)
 via `pi-black`. To route it at a local Ollama endpoint instead, declare the
