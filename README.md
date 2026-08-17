@@ -5,10 +5,14 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 
 ## Pieces
 
-- **`main.go`** (`linear-agent`) — HTTP receiver for Linear's `AgentSessionEvent`
+- **`*.go`** (`linear-agent`) — HTTP receiver for Linear's `AgentSessionEvent`
   webhooks. Verifies the HMAC signature, acks the session with a `thought`
   activity, and dispatches a parameterized Nomad batch job to run the actual
   agent in isolation. Refreshes its own Linear OAuth access token in place.
+  Split by concern: `config.go` (env config), `client.go` (shared client +
+  persisted OAuth state), `linear.go` (Linear GraphQL API + token refresh),
+  `webhook.go` (HTTP handler), `nomad.go` (job dispatch), `payload.go`
+  (shrinking oversized webhook payloads to fit Nomad's dispatch limit).
 - **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
   refresh token.
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as
@@ -36,7 +40,7 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 This repo owns **no secrets**. Every module option that needs one is a
 `*File` path (`webhookSecretFile`, `refreshTokenFile`, `clientIdFile`,
 `clientSecretFile`, `nomadTokenFile`, `githubPatFile`,
-`nomadBootstrapTokenFile`) — `main.go` reads `<KEY>_FILE` in preference to a
+`nomadBootstrapTokenFile`) — `config.go` reads `<KEY>_FILE` in preference to a
 bare `<KEY>` env var. The consuming flake is responsible for decrypting
 secret material and handing over paths, e.g. sops-nix's
 `config.sops.secrets.<name>.path`.
@@ -106,9 +110,10 @@ dead endpoint). An ollama-routed worker runs exactly one model, hence a single
 required `model` rather than a list.
 
 `provider`/`model`/`thinkingLevel` set the fleet-wide default. `linear-agent`'s
-`dispatchNomad` (`main.go`) always sends `model`/`thinking` dispatch Meta,
-defaulting to `services.linearAgent.defaultModel`/`defaultThinking` (which
-should match the fleet default above) — the entrypoint reads those as
+`dispatchNomad` (`nomad.go`) always sends `model`/`thinking` dispatch Meta,
+resolved by `webhook.go`'s `resolveRouting` and defaulting to
+`services.linearAgent.defaultModel`/`defaultThinking` (which should match the
+fleet default above) — the entrypoint reads those as
 `NOMAD_META_model`/`NOMAD_META_thinking` and passes them to `pi` as
 `--model`/`--thinking`.
 
