@@ -87,6 +87,29 @@ let
     '';
   };
 
+  # playwright-ts (psyduck-etl/playwright-ts, the plugin registry jobs run
+  # through) only ever launches firefox — session.ts calls `firefox.launch`
+  # exclusively. Build just that engine: nixpkgs' full playwright-driver.browsers
+  # set also carries chromium, webkit and ffmpeg, which would roughly triple this
+  # for engines nothing here uses.
+  playwrightBrowsers = pkgs.playwright-driver.browsers.override {
+    withChromium = false;
+    withChromiumHeadlessShell = false;
+    withWebkit = false;
+    withFfmpeg = false;
+  };
+
+  # Site modules (and playwright-ts itself) `import ... from "playwright"`, not
+  # "playwright-core" — nixpkgs only packages the latter at the top level
+  # (pkgs.playwright). The two are the same launchers under a different name
+  # (playwright-core's index re-exports chromium/firefox/webkit identically), so
+  # alias it under the name Node's resolver is asked for rather than building a
+  # second copy of the package from npm.
+  playwrightNodeModules = pkgs.runCommand "pi-playwright-node-modules" { } ''
+    mkdir -p $out
+    ln -s ${pkgs.playwright} $out/playwright
+  '';
+
   # From-scratch runtime image, nix-built. It reaches both server boxes through
   # the system closure: the job JSON embeds "docker-archive:${piImage}" and the
   # podman driver's docker-archive: transport ImageLoads that store path — no
@@ -106,7 +129,10 @@ let
   # dispatches — see README for why, and the still-open gap around private
   # git+ssh flake inputs (e.g. free-code) whose fetch requires an SSH key.
   # pi itself is NOT baked — it rides the /opt/pi bind-mount. glibc supplies
-  # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
+  # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here. playwright +
+  # firefox (playwrightNodeModules / playwrightBrowsers, above) satisfy registry
+  # jobs' `bin/check` — it runs the playwright-navigate transformer, which
+  # launches firefox against a scraper module's careers page.
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -124,6 +150,8 @@ let
       pkgs.glibc
       pkgs.nix
       pkgs.go
+      playwrightNodeModules
+      playwrightBrowsers
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -135,6 +163,8 @@ let
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "NODE_PATH=${playwrightNodeModules}"
+        "PLAYWRIGHT_BROWSERS_PATH=${playwrightBrowsers}"
         "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false"
         "SHELL=/bin/bash"
         "HOME=/root"
