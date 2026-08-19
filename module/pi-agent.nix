@@ -107,6 +107,16 @@ let
   # git+ssh flake inputs (e.g. free-code) whose fetch requires an SSH key.
   # pi itself is NOT baked — it rides the /opt/pi bind-mount. glibc supplies
   # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
+  #
+  # playwright-test (nixpkgs) ships the real `playwright` npm package (not just
+  # `playwright-core`) as lib/node_modules/playwright, and playwright-driver's
+  # chromium is already autoPatchelf'd against its own buildInputs — no
+  # `playwright install-deps` needed. Together with NODE_PATH/
+  # PLAYWRIGHT_BROWSERS_PATH below they satisfy the exact preflight
+  # gastrodon/jobsearch-registry's `bin/check` runs before validating a site
+  # module. Chromium-only (not the full firefox/webkit/ffmpeg `browsers` set):
+  # jobsearch-registry's playwright-navigate transformer scrapes career pages
+  # headlessly, which only needs one engine.
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -124,6 +134,8 @@ let
       pkgs.glibc
       pkgs.nix
       pkgs.go
+      pkgs.playwright-test
+      pkgs.playwright-driver.browsers-chromium
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -138,6 +150,9 @@ let
         "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false"
         "SHELL=/bin/bash"
         "HOME=/root"
+        "NODE_PATH=${pkgs.playwright-test}/lib/node_modules"
+        "PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers-chromium}"
+        "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true"
       ];
       WorkingDir = "/";
     };
