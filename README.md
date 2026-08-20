@@ -26,8 +26,12 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   changes the same way its CI does, e.g. `nix build
   .#nixosConfigurations.<host>.config.system.build.toplevel --impure`, and
   `go` so pibot can `go build`/`go test`/`go vet` when it's dispatched to work
-  in a Go repo (including its own, `gastrodon/pibot`). Nix
-  store state isn't persisted across dispatches, and dotfiles' `free-code` and
+  in a Go repo (including its own, `gastrodon/pibot`), and `psyduck` (from the
+  `psyduck` flake input) + `bun` + a Firefox-only playwright browser set (from
+  the `nixpkgs-playwright` flake input, pinned to match the npm `playwright`
+  version `psyduck-etl/playwright-ts` embeds) so pibot can run
+  `gastrodon/jobsearch-registry`'s `bin/check` when it's dispatched to work
+  there. Nix store state isn't persisted across dispatches, and dotfiles' `free-code` and
   `ifunny-re` flake inputs are private repos fetched over `git+ssh` — pibot has
   no SSH key, so a build touching those inputs will fail to fetch them until
   that's resolved.
