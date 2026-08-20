@@ -12,6 +12,10 @@
   config,
   lib,
   pkgs,
+  # The psyduck host binary for the caller's system, supplied by flake.nix's
+  # nixosModules.piAgent (curried from the psyduck flake input) — not a
+  # standard NixOS module arg.
+  psyduckPackage,
   ...
 }:
 let
@@ -107,6 +111,34 @@ let
   # git+ssh flake inputs (e.g. free-code) whose fetch requires an SSH key.
   # pi itself is NOT baked — it rides the /opt/pi bind-mount. glibc supplies
   # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
+  #
+  # psyduck (the ETL host binary, gastrodon/psyduck via the flake input of the
+  # same name) and playwright ride along too: registry repos like
+  # jobsearch-registry drive a real psyduck pipeline through a
+  # playwright-navigate transformer to validate a scraper module, and their
+  # check harness looks for exactly this toolchain (a `psyduck` binary, a
+  # node_modules with `playwright`, and a browsers dir) via the PSYDUCK,
+  # NODE_PATH and PLAYWRIGHT_BROWSERS_PATH env vars set below — nix-built and
+  # pre-fetched, so no network round-trip per dispatch. playwright-driver's
+  # `browsers` passthru only carries Chromium/Firefox/WebKit + ffmpeg, not a
+  # plugin binary for any given transformer plugin (e.g. playwright-ts) — that
+  # still has to be built or supplied separately.
+  #
+  # playwright-test's own $out root (package.json, lib/, etc.) is an npm
+  # package layout, not something to dump directly into the container's /
+  # alongside coreutils/glibc/etc. — nest it under /opt/playwright instead,
+  # the same way piPkg rides /opt/pi.
+  playwrightPkg = pkgs.linkFarm "pi-agent-playwright" [
+    {
+      name = "opt/playwright/node_modules";
+      path = "${pkgs.playwright-test}/lib/node_modules";
+    }
+    {
+      name = "opt/playwright/browsers";
+      path = pkgs.playwright-driver.browsers;
+    }
+  ];
+
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -124,6 +156,8 @@ let
       pkgs.glibc
       pkgs.nix
       pkgs.go
+      psyduckPackage
+      playwrightPkg
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -138,6 +172,10 @@ let
         "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false"
         "SHELL=/bin/bash"
         "HOME=/root"
+        "PSYDUCK=/bin/psyduck"
+        "NODE_PATH=/opt/playwright/node_modules"
+        "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers"
+        "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true"
       ];
       WorkingDir = "/";
     };

@@ -30,7 +30,12 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   store state isn't persisted across dispatches, and dotfiles' `free-code` and
   `ifunny-re` flake inputs are private repos fetched over `git+ssh` — pibot has
   no SSH key, so a build touching those inputs will fail to fetch them until
-  that's resolved.
+  that's resolved. It also carries `psyduck` (`gastrodon/psyduck`, pulled in as
+  a flake input and built the same as any other package) and Playwright
+  (`/opt/playwright`, `NODE_PATH`/`PLAYWRIGHT_BROWSERS_PATH` pointed at it) so
+  pibot can drive real psyduck pipelines — e.g. running a registry repo's own
+  `playwright-navigate` validation check — without fetching either toolchain
+  per dispatch.
 - **`module/pi-agent-system-prompt.md`** — the worker's operating manual, baked
   into the runtime image and passed as `--append-system-prompt`. Linear's
   workspace/team agent guidance is appended per-dispatch.
