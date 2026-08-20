@@ -12,6 +12,11 @@
   config,
   lib,
   pkgs,
+  # The psyduck host binary and a Firefox-only playwright browser set, wired
+  # in by flake.nix's piAgent wrapper (built from this repo's own psyduck /
+  # nixpkgs-playwright flake inputs, not from `pkgs`).
+  psyduckPkg,
+  playwrightBrowsers,
   ...
 }:
 let
@@ -97,16 +102,27 @@ let
   # coreutils supplies neither), bash, coreutils, cacert, go (pibot's own repo,
   # gastrodon/pibot, is a Go module — `go build`/`go test`/`go vet` need the
   # toolchain on PATH the same as any other language pibot is dispatched to work
-  # in). nix lets pibot build/test gastrodon/dotfiles the same way CI does — `nix
-  # build .#nixosConfigurations.<host>.config.system.build.toplevel --impure` and
-  # `nix flake check`/`nixfmt --check`. sandbox is disabled: the podman task runs
-  # unprivileged and can't create the user/mount namespaces a sandboxed nix build
-  # needs; build-users-group is left unset so nix builds directly as the container's
-  # root user (no nixbld users exist here). Store state is not persisted across
-  # dispatches — see README for why, and the still-open gap around private
-  # git+ssh flake inputs (e.g. free-code) whose fetch requires an SSH key.
-  # pi itself is NOT baked — it rides the /opt/pi bind-mount. glibc supplies
-  # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
+  # in). psyduck + bun + a Firefox-only playwright browser set cover registry
+  # jobs (gastrodon/jobsearch-registry's `bin/check` drives a real psyduck
+  # pipeline through the psyduck-etl/playwright-ts plugin, which is bun-native
+  # — Firefox only because that's the one browser gastrodon/jobsearch-etl's own
+  # playwright producers use, and matching it keeps one browser download
+  # pinned instead of three). nix lets pibot build/test gastrodon/dotfiles the same way CI
+  # does — `nix build .#nixosConfigurations.<host>.config.system.build.toplevel
+  # --impure` and `nix flake check`/`nixfmt --check`. sandbox is disabled: the
+  # podman task runs unprivileged and can't create the user/mount namespaces a
+  # sandboxed nix build needs; build-users-group is left unset so nix builds
+  # directly as the container's root user (no nixbld users exist here). Store
+  # state is not persisted across dispatches — see README for why, and the
+  # still-open gap around private git+ssh flake inputs (e.g. free-code) whose
+  # fetch requires an SSH key.
+  # pi itself is NOT baked — it rides the /opt/pi bind-mount, and its glibc
+  # override is scoped to just its own invocation in the entrypoint (below),
+  # not exported container-wide: playwrightBrowsers' Firefox is a nixpkgs
+  # build off a newer glibc than nixos-25.11's, and a global LD_LIBRARY_PATH
+  # pointed at the older one breaks it (`undefined symbol:
+  # __nptl_change_stack_perm`) while leaving it unset lets Firefox's own
+  # rpath resolve correctly.
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -124,6 +140,9 @@ let
       pkgs.glibc
       pkgs.nix
       pkgs.go
+      pkgs.bun
+      psyduckPkg
+      playwrightBrowsers
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -131,13 +150,14 @@ let
     config = {
       Env = [
         "PATH=/bin"
-        "LD_LIBRARY_PATH=${pkgs.glibc}/lib"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false"
         "SHELL=/bin/bash"
         "HOME=/root"
+        "PLAYWRIGHT_BROWSERS_PATH=${playwrightBrowsers}"
+        "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true"
       ];
       WorkingDir = "/";
     };
@@ -307,7 +327,12 @@ let
         fifo=/local/rpcin
         rm -f "$fifo"
         mkfifo "$fifo"
-        /opt/pi/pi --mode rpc \
+        # LD_LIBRARY_PATH is scoped to just this invocation, not exported
+        # container-wide: pi is an unpatched Bun single-exec expecting glibc at
+        # the FHS /lib64/ld-linux path, but a global override would also catch
+        # Firefox (playwright, below) and break its own, differently-versioned
+        # glibc rpath.
+        LD_LIBRARY_PATH="${pkgs.glibc}/lib" /opt/pi/pi --mode rpc \
           --append-system-prompt "$sys" \
           --exclude-tools ask_question \
           $model_args $think_args <"$fifo" >/local/pi.jsonl 2>/local/pi-err.txt &
