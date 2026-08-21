@@ -12,6 +12,11 @@
   config,
   lib,
   pkgs,
+  # The psyduck host binary and a Firefox-only playwright browser set, wired
+  # in by flake.nix's piAgent wrapper (built from this repo's own psyduck /
+  # nixpkgs-playwright flake inputs, not from `pkgs`).
+  psyduckPkg,
+  playwrightBrowsers,
   ...
 }:
 let
@@ -97,16 +102,27 @@ let
   # coreutils supplies neither), bash, coreutils, cacert, go (pibot's own repo,
   # gastrodon/pibot, is a Go module — `go build`/`go test`/`go vet` need the
   # toolchain on PATH the same as any other language pibot is dispatched to work
-  # in). nix lets pibot build/test gastrodon/dotfiles the same way CI does — `nix
-  # build .#nixosConfigurations.<host>.config.system.build.toplevel --impure` and
-  # `nix flake check`/`nixfmt --check`. sandbox is disabled: the podman task runs
-  # unprivileged and can't create the user/mount namespaces a sandboxed nix build
-  # needs; build-users-group is left unset so nix builds directly as the container's
-  # root user (no nixbld users exist here). Store state is not persisted across
-  # dispatches — see README for why, and the still-open gap around private
-  # git+ssh flake inputs (e.g. free-code) whose fetch requires an SSH key.
-  # pi itself is NOT baked — it rides the /opt/pi bind-mount. glibc supplies
-  # /lib64/ld-linux-x86-64.so.2 so the unpatched Bun exec runs here.
+  # in). psyduck + bun + a Firefox-only playwright browser set cover registry
+  # jobs (gastrodon/jobsearch-registry's `bin/check` drives a real psyduck
+  # pipeline through the psyduck-etl/playwright-ts plugin, which is bun-native
+  # — Firefox only because that's the one browser gastrodon/jobsearch-etl's own
+  # playwright producers use, and matching it keeps one browser download
+  # pinned instead of three). nix lets pibot build/test gastrodon/dotfiles the same way CI
+  # does — `nix build .#nixosConfigurations.<host>.config.system.build.toplevel
+  # --impure` and `nix flake check`/`nixfmt --check`. sandbox is disabled: the
+  # podman task runs unprivileged and can't create the user/mount namespaces a
+  # sandboxed nix build needs; build-users-group is left unset so nix builds
+  # directly as the container's root user (no nixbld users exist here). Store
+  # state is not persisted across dispatches — see README for why, and the
+  # still-open gap around private git+ssh flake inputs (e.g. free-code) whose
+  # fetch requires an SSH key.
+  # pi itself is NOT baked — it rides the /opt/pi bind-mount, and its glibc
+  # override is scoped to just its own invocation in the entrypoint (below),
+  # not exported container-wide: playwrightBrowsers' Firefox is a nixpkgs
+  # build off a newer glibc than nixos-25.11's, and a global LD_LIBRARY_PATH
+  # pointed at the older one breaks it (`undefined symbol:
+  # __nptl_change_stack_perm`) while leaving it unset lets Firefox's own
+  # rpath resolve correctly.
   piImage = pkgs.dockerTools.buildLayeredImage {
     name = "pibot-pi";
     tag = "latest";
@@ -124,6 +140,9 @@ let
       pkgs.glibc
       pkgs.nix
       pkgs.go
+      pkgs.bun
+      psyduckPkg
+      playwrightBrowsers
     ];
     extraCommands = ''
       mkdir -p tmp var/tmp
@@ -131,13 +150,14 @@ let
     config = {
       Env = [
         "PATH=/bin"
-        "LD_LIBRARY_PATH=${pkgs.glibc}/lib"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "NIX_CONFIG=experimental-features = nix-command flakes\nsandbox = false"
         "SHELL=/bin/bash"
         "HOME=/root"
+        "PLAYWRIGHT_BROWSERS_PATH=${playwrightBrowsers}"
+        "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true"
       ];
       WorkingDir = "/";
     };
@@ -184,17 +204,72 @@ let
       export LINEAR_ACCESS_TOKEN="$NOMAD_META_access_token"
     fi
 
-    # The receiver (linear-agent's dispatchNomad/buildPrompt) already extracts
-    # and assembles the prompt from Linear's webhook — issue title/description,
-    # session summary, and the triggering message — into a single `prompt`
-    # field, so the payload here is small and its shape is exactly what pi
-    # should run on. Fall back to the whole payload only for a manual/malformed
-    # dispatch that skipped the receiver (e.g. a hand-rolled `nomad job
-    # dispatch`), so we never send pi an empty prompt.
-    prompt=$(jq -r '
-      def useful: if . == null then null elif (type == "string" and length == 0) then null else . end;
-      (.prompt | useful) // tojson
-    ' /local/webhook.json)
+        # post <activity-type> <body-file> — one agentActivityCreate. jq --rawfile
+        # reads the body as a string var, so pi's output (quotes/newlines/
+        # backslashes) is correctly JSON-escaped; shell string-building would
+        # produce invalid JSON.
+        post() {
+          jq -n \
+            --rawfile body "$2" \
+            --arg session "$NOMAD_META_session_id" \
+            --arg act "$1" \
+            '{query:"mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }",variables:{input:{agentSessionId:$session,content:{type:$act,body:$body}}}}' \
+            > /local/req.json
+          curl -sS -X POST https://api.linear.app/graphql \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NOMAD_META_access_token" \
+            --data @/local/req.json
+        }
+
+        # fail <message> — surface a worker-side failure as a Linear `error`
+        # activity and stop. Anything that stops pi from running at all belongs
+        # here: the thread must never be left guessing why nothing happened.
+        fail() {
+          {
+            printf '%s\n\n' "$1"
+            printf 'worker: node=%s alloc=%s\n' "''${NOMAD_NODE_NAME:-unknown}" "''${NOMAD_ALLOC_ID:-unknown}"
+          } > /local/pi-out.txt
+          post error /local/pi-out.txt
+          exit 1
+        }
+
+        # Provider credentials. auth.json lives on the persistent volume and pi
+        # rewrites it as tokens rotate, so only ever seed a *missing* one — never
+        # clobber a live token with the (older) copy from the credential mount.
+        #
+        # An unseeded node is the failure this guards. pi answers the prompt with
+        # {"command":"prompt","success":false,"error":"No API key found for the
+        # selected model"} and then sits idle — RPC mode keeps the process alive
+        # while stdin is open, so nothing else is ever written to pi.jsonl and the
+        # run is killed at the deadline below having produced no text and run no
+        # tools. Every node the job can be placed on needs credentials, and a node
+        # that lacks them has to say so rather than burn 30 minutes in silence.
+        auth="$HOME/.pi/agent/auth.json"
+        authed() { [ -s "$auth" ] && [ "$(jq -r 'keys | length' "$auth" 2>/dev/null || echo 0)" != "0" ]; }
+        if ! authed && [ -s /run/pi-auth ]; then
+          install -m 0600 /run/pi-auth "$auth"
+          echo "seeded $auth from the worker credential mount" >&2
+        fi
+        # Message lines are printf arguments, not a multi-line shell string: the
+        # script body is indented, and indented lines would reach Linear as a
+        # markdown code block.
+        if ! authed; then
+          fail "$(printf '%s\n' \
+            "This worker has no provider credentials, so pi could not have run." \
+            "" \
+            "$auth on this node is missing or empty, and nothing was mounted at /run/pi-auth to seed it from. Point services.piAgent.authFile at the credentials and re-dispatch — every node the pi-agent job can be placed on needs them.")"
+        fi
+
+        # The receiver already extracts and assembles the prompt (issue title/
+        # description, session summary, thread context, triggering message)
+        # into a single `prompt` field — see linear-agent's dispatchNomad/
+        # buildPrompt. Fall back to the whole payload only for a manual/
+        # malformed dispatch that skipped the receiver, so we never send pi an
+        # empty prompt.
+        prompt=$(jq -r '
+          def useful: if . == null then null elif (type == "string" and length == 0) then null else . end;
+          (.prompt | useful) // tojson
+        ' /local/webhook.json)
 
     model_args=""
     if [ -n "''${NOMAD_META_model:-}" ]; then model_args="--model ''${NOMAD_META_model}"; fi
@@ -216,7 +291,11 @@ let
     fifo=/local/rpcin
     rm -f "$fifo"
     mkfifo "$fifo"
-    /opt/pi/pi --mode rpc \
+    # LD_LIBRARY_PATH is scoped to just this invocation, not exported
+    # container-wide: pi is an unpatched Bun single-exec expecting glibc at the
+    # FHS /lib64/ld-linux path, but a global override would also catch Firefox
+    # (playwright, below) and break its own, differently-versioned glibc rpath.
+    LD_LIBRARY_PATH="${pkgs.glibc}/lib" /opt/pi/pi --mode rpc \
       --append-system-prompt "$sys" \
       --exclude-tools ask_question \
       $model_args $think_args <"$fifo" >/local/pi.jsonl 2>/local/pi-err.txt &
@@ -224,7 +303,7 @@ let
     exec 3>"$fifo"
     printf '{"type":"prompt","message":%s}\n' "$(printf '%s' "$prompt" | jq -Rs .)" >&3
 
-    # Wait for the session to settle, bounded by a 30m deadline.
+    # Wait for the session to settle, bounded by the configured deadline.
     #
     # The sentinel MUST be agent_settled, not agent_end. agent_end fires once per
     # *low-level* agent run and is explicitly "may still be followed by retry,
@@ -233,13 +312,26 @@ let
     # about to resume the run. Breaking on the first agent_end therefore killed pi
     # mid-flight on any retried session: the work was left half-done, and because
     # the turns up to that point are typically thinking+toolCall with no text block,
-    # the reply came out empty and Linear got the "pi completed without a text
-    # response." fallback. agent_settled is the terminal event — no retry,
+    # the reply came out empty. agent_settled is the terminal event — no retry,
     # compaction retry, or queued continuation remains. (Added upstream in 0.80.4;
     # this image pins 0.84.1, so it is always emitted.)
-    deadline=$(( $(date +%s) + 1800 ))
+    #
+    # The loop also watches for a rejected prompt. pi acks every prompt with a
+    # {"type":"response","command":"prompt"} event as its very first line, and
+    # success:false means the run never started (bad credentials, unresolvable
+    # model). pi stays alive afterwards waiting for more stdin, so without this
+    # check a rejection is indistinguishable from a slow run and burns the full
+    # deadline. Only the first line is inspected, so this stays cheap as pi.jsonl
+    # grows.
+    settled=0
+    rejected=""
+    deadline=$(( $(date +%s) + ${toString cfg.timeoutSeconds} ))
     while kill -0 "$pipid" 2>/dev/null; do
-      if grep -q '"type":"agent_settled"' /local/pi.jsonl 2>/dev/null; then break; fi
+      if grep -q '"type":"agent_settled"' /local/pi.jsonl 2>/dev/null; then settled=1; break; fi
+      rejected=$(head -n 1 /local/pi.jsonl 2>/dev/null \
+        | jq -r 'select(.type == "response" and .command == "prompt" and .success == false)
+                 | .error // "prompt rejected"' 2>/dev/null || true)
+      if [ -n "$rejected" ]; then break; fi
       if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
       sleep 2
     done
@@ -269,34 +361,48 @@ let
       | tail -n 1 > /local/pi-last.json || true
     jq -r '.' /local/pi-last.json > /local/pi-out.txt 2>/dev/null || : > /local/pi-out.txt
 
+    if [ -n "$rejected" ]; then
+      fail "$(printf '%s\n\n%s\n' "pi rejected the prompt and never started a run:" "$rejected")"
+    fi
+
+    # Report the outcome. A run that produced no text is a *failure* and is
+    # posted as one, carrying whatever evidence exists — a bare "pi completed
+    # without a text response." posted as a normal `response` reads like a
+    # benign result and hides hard failures (an unseeded node, a run
+    # guillotined mid-flight) behind identical, undiagnosable text.
     if [ "$rc" -ne 0 ]; then
       act=error
-      { echo "pi exited nonzero (rc=$rc):"; tail -n 40 /local/pi-err.txt; } > /local/pi-out.txt
+      { echo "pi exited nonzero (rc=$rc):"; echo; tail -n 40 /local/pi-err.txt; } > /local/pi-out.txt
     elif [ ! -s /local/pi-out.txt ]; then
-      # Never post an empty comment: fall back to a tool-run summary so the Linear
-      # thread always carries signal about what pi did.
-      act=response
-      { echo "pi completed without a text response.";
-        tools=$(jq -r 'select(.type=="tool_execution_start") | .toolName' /local/pi.jsonl 2>/dev/null | sort | uniq -c);
+      act=error
+      {
+        if [ "$settled" = 1 ]; then
+          echo "pi settled without producing a text response."
+        else
+          echo "pi produced no text response and was stopped at the ${toString cfg.timeoutSeconds}s deadline without settling."
+        fi
+        printf '\nworker: node=%s alloc=%s\n' "''${NOMAD_NODE_NAME:-unknown}" "''${NOMAD_ALLOC_ID:-unknown}"
+        tools=$(jq -r 'select(.type=="tool_execution_start") | .toolName' /local/pi.jsonl 2>/dev/null | sort | uniq -c)
         if [ -n "$tools" ]; then echo; echo "tools run:"; echo "$tools"; fi
+        echo; echo "last events:"
+        tail -n 5 /local/pi.jsonl 2>/dev/null | cut -c1-400
+        if [ -s /local/pi-err.txt ]; then echo; echo "stderr:"; tail -n 20 /local/pi-err.txt; fi
       } > /local/pi-out.txt
+    elif [ "$settled" != 1 ]; then
+      # There is text, but pi was still going when the deadline cut it off, so
+      # the answer may be mid-thought. Post it — it is the best signal we have —
+      # and say plainly that it was truncated.
+      act=response
+      {
+        cat /local/pi-out.txt
+        printf '\n\n---\n_pibot: this run hit the ${toString cfg.timeoutSeconds}s deadline and was stopped before pi finished, so the above may be incomplete._\n'
+      } > /local/pi-final.txt
+      mv /local/pi-final.txt /local/pi-out.txt
     else
       act=response
     fi
 
-    # Build the GraphQL body with jq so pi's output (quotes/newlines/backslashes)
-    # is correctly JSON-escaped — shell string-building would produce invalid JSON.
-    # --rawfile reads pi-out.txt as a string var, so the body is escaped safely.
-    jq -n \
-      --rawfile body /local/pi-out.txt \
-      --arg session "$NOMAD_META_session_id" \
-      --arg act "$act" \
-      '{query:"mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }",variables:{input:{agentSessionId:$session,content:{type:$act,body:$body}}}}' \
-      > /local/req.json
-    curl -sS -X POST https://api.linear.app/graphql \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $NOMAD_META_access_token" \
-      --data @/local/req.json
+    post "$act" /local/pi-out.txt
   '';
 
   # Ship the script as a file in piPkg and run it, rather than inlining it as the
@@ -329,12 +435,25 @@ let
         {
           Name = "pi";
           Count = 1;
-          # Pin to the server boxes — only they carry piPkg's store path and the
-          # /var/lib/pi-agent/home auth volume (rpi clients are arm64 and lack both).
+          # Pin to nodes that opt in via meta.pi_worker — they are the ones
+          # carrying piPkg's store path and the /var/lib/pi-agent/home auth volume.
+          #
+          # The architecture constraint is not redundant with it. Everything this
+          # task runs is x86_64: the pi release tarball is a Bun single-exec built
+          # for linux-x64, and piImage is a buildLayeredImage from an x86_64
+          # closure. On an arm64 client (the rpi) the image would load and the
+          # binary would die on exec, so an accidental meta.pi_worker there would
+          # turn every dispatch it won into a confusing failure. Say what the job
+          # actually requires instead of relying on nobody setting the flag wrong.
           Constraints = [
             {
               LTarget = "\${meta.pi_worker}";
               RTarget = "true";
+              Operand = "=";
+            }
+            {
+              LTarget = "\${attr.cpu.arch}";
+              RTarget = "amd64";
               Operand = "=";
             }
           ];
@@ -350,7 +469,15 @@ let
                   "${piPkg}:/opt/pi:ro"
                   "/var/lib/pi-agent/home:/root/.pi/agent"
                   "${cfg.githubPatFile}:/run/github-pat:ro"
-                ];
+                ]
+                ++ lib.optional (cfg.authFile != null) "${cfg.authFile}:/run/pi-auth:ro";
+              };
+              # Nomad interpolates ${...} in job-spec fields, so this resolves per
+              # dispatch: the entrypoint can name the node it ran on in every
+              # failure it reports, which is what turns "some dispatches do
+              # nothing" into "this node does nothing".
+              Env = {
+                NOMAD_NODE_NAME = "\${node.unique.name}";
               };
               Resources = {
                 CPU = 1000;
@@ -373,6 +500,33 @@ in
     githubPatFile = lib.mkOption {
       type = lib.types.path;
       description = "Path to a file containing a GitHub PAT for the worker's clone/push + PR creation.";
+    };
+
+    authFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to a file holding pi's `auth.json` (the provider credentials the
+        worker runs on), bind-mounted into the task and copied onto the
+        persistent volume the first time a node comes up without credentials.
+
+        The volume copy stays authoritative once it exists — pi rewrites it as
+        tokens rotate, and seeding never clobbers it. This option only answers
+        "what does a brand-new worker node start from", so growing the pool is a
+        deploy rather than a manual login on each box. A node with neither a
+        seeded volume nor this option fails its dispatches loudly instead of
+        idling until the deadline.
+      '';
+    };
+
+    timeoutSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 1800;
+      description = ''
+        How long a single dispatched session may run before the worker stops pi
+        and reports back. A session that hits this is cut off mid-flight, so
+        whatever pi had said by then is posted, explicitly marked incomplete.
+      '';
     };
 
     nomadBootstrapTokenFile = lib.mkOption {

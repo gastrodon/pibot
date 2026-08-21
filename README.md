@@ -5,25 +5,20 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 
 ## Pieces
 
-- **`main.go`** (`linear-agent`) — HTTP receiver for Linear's `AgentSessionEvent`
+- **`*.go`** (`linear-agent`) — HTTP receiver for Linear's `AgentSessionEvent`
   webhooks. Verifies the HMAC signature, acks the session with a `thought`
   activity, and dispatches a parameterized Nomad batch job to run the actual
   agent in isolation. Refreshes its own Linear OAuth access token in place.
-  It also builds the dispatch payload itself, rather than forwarding Linear's
-  raw webhook body: the issue title/description, session summary, and the
-  single triggering message get assembled into one `prompt` field (see
-  `buildPrompt`), so the worker always runs on a coherent instruction instead
-  of trying to guess a field name out of the webhook's actual shape (which
-  has no `promptContext` field — verified against Linear's public GraphQL
-  schema) or, worse, the entire raw JSON body. The webhook itself only ever
-  carries the single triggering message, so `dispatchNomad` also fetches the
-  issue's full comment thread and this agent session's earlier activity
-  directly from Linear (`fetchThreadContext`), using the same OAuth token
-  `postActivity` posts with — that's a plain HTTPS response, not a Nomad
-  dispatch payload, so it isn't subject to the 16KiB limit below. Any one
-  section that's still too long to fit once assembled into the prompt is
-  capped with its tail kept (`clip`); the triggering message itself is never
-  capped.
+  Split by concern: `config.go` (env config), `client.go` (shared client +
+  persisted OAuth state), `linear.go` (Linear GraphQL API, token refresh,
+  fetching thread context), `webhook.go` (HTTP handler), `nomad.go` (job
+  dispatch), `prompt.go` (assembling the dispatch prompt). The dispatch
+  payload is a `prompt` field the receiver builds itself (`buildPrompt`) from
+  the issue title/description, session summary, the issue's comment thread
+  and this session's prior activity (fetched directly from Linear —
+  `fetchThreadContext`), and the triggering message — rather than forwarding
+  Linear's raw webhook body. Every component but the triggering message is
+  capped, tail kept, to fit Nomad's 16KiB dispatch limit (`clip`).
 - **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
   refresh token.
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as
@@ -37,8 +32,12 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   changes the same way its CI does, e.g. `nix build
   .#nixosConfigurations.<host>.config.system.build.toplevel --impure`, and
   `go` so pibot can `go build`/`go test`/`go vet` when it's dispatched to work
-  in a Go repo (including its own, `gastrodon/pibot`). Nix
-  store state isn't persisted across dispatches, and dotfiles' `free-code` and
+  in a Go repo (including its own, `gastrodon/pibot`), and `psyduck` (from the
+  `psyduck` flake input) + `bun` + a Firefox-only playwright browser set (from
+  the `nixpkgs-playwright` flake input, pinned to match the npm `playwright`
+  version `psyduck-etl/playwright-ts` embeds) so pibot can run
+  `gastrodon/jobsearch-registry`'s `bin/check` when it's dispatched to work
+  there. Nix store state isn't persisted across dispatches, and dotfiles' `free-code` and
   `ifunny-re` flake inputs are private repos fetched over `git+ssh` — pibot has
   no SSH key, so a build touching those inputs will fail to fetch them until
   that's resolved.
@@ -50,7 +49,7 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 This repo owns **no secrets**. Every module option that needs one is a
 `*File` path (`webhookSecretFile`, `refreshTokenFile`, `clientIdFile`,
 `clientSecretFile`, `nomadTokenFile`, `githubPatFile`,
-`nomadBootstrapTokenFile`) — `main.go` reads `<KEY>_FILE` in preference to a
+`nomadBootstrapTokenFile`, `authFile`) — `config.go` reads `<KEY>_FILE` in preference to a
 bare `<KEY>` env var. The consuming flake is responsible for decrypting
 secret material and handing over paths, e.g. sops-nix's
 `config.sops.secrets.<name>.path`.
@@ -81,6 +80,7 @@ Add this flake as an input and import the modules you need:
             enable = true;
             githubPatFile = /* ... */;
             nomadBootstrapTokenFile = /* ... */;
+            authFile = /* ... */;
           };
         }
       ];
@@ -92,6 +92,14 @@ Add this flake as an input and import the modules you need:
 `services.piAgent` expects a Nomad client with `meta.pi_worker = "true"` (see
 the `pi_worker` constraint in `module/pi-agent.nix`) and a persistent
 `/var/lib/pi-agent/home` volume for `pi`'s auth state.
+
+**Every node carrying that meta needs credentials.** The job is placed on any
+of them, so one unseeded node silently swallows a share of all dispatches:
+`pi` rejects the prompt, then idles until the run is killed at
+`timeoutSeconds`. Set `authFile` and a new node seeds itself on its first
+dispatch (the volume copy wins ever after, since `pi` rotates it); leave it
+unset and such a node reports the problem on the Linear thread instead of
+failing quietly.
 
 By default the worker routes to Anthropic (`claude-sonnet-5`, high thinking)
 via `pi-black`. To route it at a local Ollama endpoint instead, declare the
@@ -120,9 +128,10 @@ dead endpoint). An ollama-routed worker runs exactly one model, hence a single
 required `model` rather than a list.
 
 `provider`/`model`/`thinkingLevel` set the fleet-wide default. `linear-agent`'s
-`dispatchNomad` (`main.go`) always sends `model`/`thinking` dispatch Meta,
-defaulting to `services.linearAgent.defaultModel`/`defaultThinking` (which
-should match the fleet default above) — the entrypoint reads those as
+`dispatchNomad` (`nomad.go`) always sends `model`/`thinking` dispatch Meta,
+resolved by `webhook.go`'s `resolveRouting` and defaulting to
+`services.linearAgent.defaultModel`/`defaultThinking` (which should match the
+fleet default above) — the entrypoint reads those as
 `NOMAD_META_model`/`NOMAD_META_thinking` and passes them to `pi` as
 `--model`/`--thinking`.
 

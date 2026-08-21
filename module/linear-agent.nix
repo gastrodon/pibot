@@ -5,7 +5,7 @@
 #
 # This module owns no secrets: webhookSecretFile / refreshTokenFile /
 # clientIdFile / clientSecretFile / nomadTokenFile are paths to files holding
-# the values (main.go reads <KEY>_FILE in preference to <KEY>). The consuming
+# the values (config.go reads <KEY>_FILE in preference to <KEY>). The consuming
 # flake is responsible for decrypting and supplying those paths — e.g. via
 # sops-nix's `config.sops.secrets.<name>.path`.
 {
