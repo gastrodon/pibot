@@ -13,10 +13,12 @@
 //
 //   - config.go   — env-derived configuration.
 //   - client.go   — the shared client struct and its persisted OAuth state.
-//   - linear.go   — talking to Linear's GraphQL API (activities, token refresh).
+//   - linear.go   — talking to Linear's GraphQL API (activities, token refresh,
+//     fetching thread context).
 //   - webhook.go  — the HTTP handler: signature verification and dispatch.
 //   - nomad.go    — kicking the Nomad batch job.
-//   - payload.go  — shrinking oversized webhook payloads to fit Nomad's limit.
+//   - prompt.go   — assembling the dispatch prompt from the webhook event and
+//     fetched thread context.
 package main
 
 import (

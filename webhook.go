@@ -21,9 +21,16 @@ type agentSessionEvent struct {
 	Action       string `json:"action"`
 	AgentSession struct {
 		ID      string `json:"id"`
+		Summary string `json:"summary"`
 		Comment struct {
 			Body string `json:"body"`
 		} `json:"comment"`
+		Issue struct {
+			Identifier  string `json:"identifier"`
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			URL         string `json:"url"`
+		} `json:"issue"`
 	} `json:"agentSession"`
 	AgentActivity struct {
 		Content struct {
@@ -129,7 +136,7 @@ func (c *client) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if ev.Type != "AgentSessionEvent" || ev.AgentSession.ID == "" {
 		return
 	}
-	go c.dispatch(ev, body)
+	go c.dispatch(ev)
 }
 
 // verify checks the Linear-Signature header: hex(HMAC-SHA256(rawBody, secret)).
@@ -145,11 +152,11 @@ func (c *client) verify(sig string, body []byte) bool {
 
 // dispatch posts the thought ack, then dispatches the Nomad job; on dispatch
 // failure it surfaces an error activity back to the session.
-func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
+func (c *client) dispatch(ev agentSessionEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := c.postActivity(ctx, ev.AgentSession.ID, "thought", "Picking this up — spinning up an agent."); err != nil {
+	if err := c.postActivity(ctx, ev.AgentSession.ID, "thought", ackThought); err != nil {
 		log.Printf("thought ack failed for session %s: %v", ev.AgentSession.ID, err)
 	}
 
@@ -162,7 +169,7 @@ func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
 		return
 	}
 
-	if err := c.dispatchNomad(ctx, ev, raw, model, thinking); err != nil {
+	if err := c.dispatchNomad(ctx, ev, model, thinking); err != nil {
 		log.Printf("nomad dispatch failed for session %s: %v", ev.AgentSession.ID, err)
 		msg := fmt.Sprintf("Couldn't start the agent job: %v", err)
 		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {

@@ -11,10 +11,10 @@ import (
 	"net/http"
 )
 
-// dispatchNomad kicks the parameterized batch job, passing the (possibly
-// shrunk, see shrinkPayload) webhook as the dispatch payload and the session
-// id as dispatch meta.
-func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []byte, model, thinking string) error {
+// dispatchNomad kicks the parameterized batch job, passing a curated prompt
+// (see buildPrompt) as the dispatch payload and the session id as dispatch
+// meta.
+func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model, thinking string) error {
 	// The receiver is the sole owner of the refresh token; hand the job only a
 	// short-lived access token (no refresh material) so it can post one response
 	// activity without a second refresher rotating tokens out from under us.
@@ -22,9 +22,22 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []
 	if err != nil {
 		return fmt.Errorf("get access token for dispatch: %w", err)
 	}
-	payload := shrinkPayload(raw)
-	if len(payload) != len(raw) {
-		log.Printf("session %s: webhook payload %d bytes exceeds Nomad's dispatch limit, shrunk to %d", ev.AgentSession.ID, len(raw), len(payload))
+	// Fetches the issue's comment thread and this session's prior activity; a
+	// fetch failure degrades to a narrower prompt rather than blocking dispatch.
+	tc, err := c.fetchThreadContext(ctx, token, ev.AgentSession.ID)
+	if err != nil {
+		log.Printf("session %s: fetch thread context failed, dispatching without it: %v", ev.AgentSession.ID, err)
+	}
+	payload, err := json.Marshal(map[string]string{"prompt": buildPrompt(ev, tc)})
+	if err != nil {
+		return fmt.Errorf("marshal dispatch payload: %w", err)
+	}
+	if len(payload) > maxDispatchPayload {
+		// Defensive only: buildPrompt already caps every field it draws from, so
+		// this should be unreachable outside pathological input.
+		prompt := clip(buildPrompt(ev, tc), maxDispatchPayload-256)
+		payload, _ = json.Marshal(map[string]string{"prompt": prompt})
+		log.Printf("session %s: dispatch prompt %d bytes exceeded Nomad's %d-byte limit even after field caps, hard-truncated", ev.AgentSession.ID, len(payload), maxDispatchPayload)
 	}
 	body := map[string]any{
 		"Payload": base64.StdEncoding.EncodeToString(payload),

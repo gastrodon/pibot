@@ -77,6 +77,130 @@ func (c *client) doActivity(ctx context.Context, token, sessionID, typ, body str
 	return resp.StatusCode, out, nil
 }
 
+// threadContext is the issue's comment thread and this session's prior
+// activity, fetched directly from Linear rather than carried on the webhook.
+// Both are oldest-first; buildPrompt's clip keeps the tail when a section
+// runs over budget.
+type threadContext struct {
+	comments   []string
+	activities []string
+}
+
+// threadContextQuery fetches the session's activity and, through its issue,
+// its comments. Each activity content variant is a distinct GraphQL type, so
+// each needs its own inline fragment.
+const threadContextQuery = `query($id: String!) {
+  agentSession(id: $id) {
+    activities(first: 100) {
+      nodes {
+        content {
+          __typename
+          ... on AgentActivityThoughtContent { body }
+          ... on AgentActivityActionContent { action }
+          ... on AgentActivityResponseContent { body }
+          ... on AgentActivityPromptContent { body }
+          ... on AgentActivityErrorContent { body }
+          ... on AgentActivityElicitationContent { body }
+        }
+      }
+    }
+    issue {
+      comments(first: 100) {
+        nodes { body user { name } }
+      }
+    }
+  }
+}`
+
+// fetchThreadContext queries Linear for sessionID's comment thread and prior
+// session activity, using the same OAuth token postActivity posts with. A
+// fetch failure is not fatal to dispatch — see dispatchNomad.
+func (c *client) fetchThreadContext(ctx context.Context, token, sessionID string) (threadContext, error) {
+	payload := map[string]any{
+		"query":     threadContextQuery,
+		"variables": map[string]any{"id": sessionID},
+	}
+	buf, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, linearGraphQL, bytes.NewReader(buf))
+	if err != nil {
+		return threadContext{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return threadContext{}, err
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return threadContext{}, err
+	}
+	if resp.StatusCode != http.StatusOK || bytes.Contains(out, []byte(`"errors"`)) {
+		return threadContext{}, fmt.Errorf("graphql %d: %s", resp.StatusCode, out)
+	}
+	return parseThreadContext(out)
+}
+
+// parseThreadContext decodes fetchThreadContext's response body into a
+// threadContext, split out so decoding is testable without a live API call.
+func parseThreadContext(raw []byte) (threadContext, error) {
+	var parsed struct {
+		Data struct {
+			AgentSession struct {
+				Activities struct {
+					Nodes []struct {
+						Content struct {
+							Typename string `json:"__typename"`
+							Body     string `json:"body"`
+							Action   string `json:"action"`
+						} `json:"content"`
+					} `json:"nodes"`
+				} `json:"activities"`
+				Issue struct {
+					Comments struct {
+						Nodes []struct {
+							Body string `json:"body"`
+							User *struct {
+								Name string `json:"name"`
+							} `json:"user"`
+						} `json:"nodes"`
+					} `json:"comments"`
+				} `json:"issue"`
+			} `json:"agentSession"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return threadContext{}, fmt.Errorf("decode thread context: %w", err)
+	}
+
+	var tc threadContext
+	// Linear returns both connections newest-first; walk backwards so every
+	// slice buildPrompt sees is oldest-first, like every other field it draws
+	// from.
+	nodes := parsed.Data.AgentSession.Activities.Nodes
+	for i := len(nodes) - 1; i >= 0; i-- {
+		content := nodes[i].Content
+		label := strings.TrimSuffix(strings.TrimPrefix(content.Typename, "AgentActivity"), "Content")
+		switch {
+		case content.Body != "":
+			tc.activities = append(tc.activities, label+": "+content.Body)
+		case content.Action != "":
+			tc.activities = append(tc.activities, label+": "+content.Action)
+		}
+	}
+	comments := parsed.Data.AgentSession.Issue.Comments.Nodes
+	for i := len(comments) - 1; i >= 0; i-- {
+		who := "someone"
+		if u := comments[i].User; u != nil && u.Name != "" {
+			who = u.Name
+		}
+		tc.comments = append(tc.comments, who+": "+comments[i].Body)
+	}
+	return tc, nil
+}
+
 // isAuthFailure reports whether a Linear response indicates an expired/invalid
 // token (worth a refresh + retry). GraphQL auth errors can arrive 200/400 with
 // an AUTHENTICATION code rather than a 401.
