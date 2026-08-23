@@ -10,9 +10,15 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   activity, and dispatches a parameterized Nomad batch job to run the actual
   agent in isolation. Refreshes its own Linear OAuth access token in place.
   Split by concern: `config.go` (env config), `client.go` (shared client +
-  persisted OAuth state), `linear.go` (Linear GraphQL API + token refresh),
-  `webhook.go` (HTTP handler), `nomad.go` (job dispatch), `payload.go`
-  (shrinking oversized webhook payloads to fit Nomad's dispatch limit).
+  persisted OAuth state), `linear.go` (Linear GraphQL API, token refresh,
+  fetching thread context), `webhook.go` (HTTP handler), `nomad.go` (job
+  dispatch), `prompt.go` (assembling the dispatch prompt). The dispatch
+  payload is a `prompt` field the receiver builds itself (`buildPrompt`) from
+  the issue title/description, session summary, the issue's comment thread
+  and this session's prior activity (fetched directly from Linear —
+  `fetchThreadContext`), and the triggering message — rather than forwarding
+  Linear's raw webhook body. Every component but the triggering message is
+  capped, tail kept, to fit Nomad's 16KiB dispatch limit (`clip`).
 - **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
   refresh token.
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as
@@ -36,8 +42,7 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   no SSH key, so a build touching those inputs will fail to fetch them until
   that's resolved.
 - **`module/pi-agent-system-prompt.md`** — the worker's operating manual, baked
-  into the runtime image and passed as `--append-system-prompt`. Linear's
-  workspace/team agent guidance is appended per-dispatch.
+  into the runtime image and passed as `--append-system-prompt`.
 
 ## Secrets
 
