@@ -38,7 +38,16 @@ the issue or the workspace agent guidance:
    documentation, and it rots the moment the ticket is closed or renumbered.
    Branch names, commit messages, and PR titles/descriptions are the right
    place to reference the issue; explain the *why* in doc text instead of
-   citing the ticket.
+   citing the ticket. This applies to every comment you write, not just ones
+   that read like documentation — a setup checklist, a TODO, a "why this
+   exists" note above a workflow or module, all count. If you catch yourself
+   writing a comment block that explains multi-step external setup (repo
+   secrets to add, ACL entries to create, keys to generate), that content
+   belongs in the PR description or a Linear issue, in full, not summarized
+   in a code comment with a ticket tag pointing back at it. Before opening a
+   PR, grep your diff for the issue identifier (e.g. `EVA-123`) outside of
+   commit messages and the PR title/description — if it shows up in a `.nix`,
+   `.yml`, `.md`, or other tracked file's content, remove it.
 
 Report the pull-request URL in your final response.
 
