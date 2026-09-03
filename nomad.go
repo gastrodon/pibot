@@ -11,10 +11,34 @@ import (
 	"net/http"
 )
 
-// dispatchNomad kicks the parameterized batch job, passing the (possibly
-// shrunk, see shrinkPayload) webhook as the dispatch payload and the session
-// id as dispatch meta.
-func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []byte, model, thinking string) error {
+// fallbackSessionContext builds a degraded sessionContext directly from the
+// webhook, for when fetchSessionContext's Linear round trip fails. It carries
+// only what the webhook itself already has: no thread, and the trigger
+// classified as best it can from the action field alone —
+// fetchSessionContext is the only place that can tell a plain assignment
+// from a real mention (via isArtificialAgentSessionRoot), so a degraded
+// prompt calls it TriggerMention either way rather than guessing further.
+func fallbackSessionContext(ev agentSessionEvent) sessionContext {
+	trigger := TriggerMention
+	if ev.Action == "prompted" {
+		trigger = TriggerPrompted
+	}
+	return sessionContext{
+		Issue: issueRef{
+			Identifier: ev.AgentSession.Issue.Identifier,
+			URL:        ev.AgentSession.Issue.URL,
+			Team:       ev.AgentSession.Issue.Team.Key,
+		},
+		Trigger: trigger,
+		Request: ev.triggerBody(),
+	}
+}
+
+// dispatchNomad resolves this session's context (thread + issue identity,
+// fetched fresh from Linear — see fetchSessionContext), builds the system and
+// user prompt from it, and kicks the parameterized batch job with both as
+// the dispatch payload.
+func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model, thinking string) error {
 	// The receiver is the sole owner of the refresh token; hand the job only a
 	// short-lived access token (no refresh material) so it can post one response
 	// activity without a second refresher rotating tokens out from under us.
@@ -22,10 +46,22 @@ func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, raw []
 	if err != nil {
 		return fmt.Errorf("get access token for dispatch: %w", err)
 	}
-	payload := shrinkPayload(raw)
-	if len(payload) != len(raw) {
-		log.Printf("session %s: webhook payload %d bytes exceeds Nomad's dispatch limit, shrunk to %d", ev.AgentSession.ID, len(raw), len(payload))
+
+	sc, err := c.fetchSessionContext(ctx, ev.AgentSession.ID, ev.Action)
+	if err != nil {
+		log.Printf("session %s: fetch context failed, falling back to a narrower prompt: %v", ev.AgentSession.ID, err)
+		sc = fallbackSessionContext(ev)
 	}
+
+	system, prompt, err := buildPrompt(sc)
+	if err != nil {
+		return fmt.Errorf("build prompt: %w", err)
+	}
+	payload, err := json.Marshal(map[string]string{"system": system, "prompt": prompt})
+	if err != nil {
+		return fmt.Errorf("marshal dispatch payload: %w", err)
+	}
+
 	body := map[string]any{
 		"Payload": base64.StdEncoding.EncodeToString(payload),
 		"Meta": map[string]string{

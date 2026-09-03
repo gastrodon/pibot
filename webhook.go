@@ -24,6 +24,17 @@ type agentSessionEvent struct {
 		Comment struct {
 			Body string `json:"body"`
 		} `json:"comment"`
+		// Issue backs fallbackSessionContext only — the path used when
+		// fetchSessionContext's Linear round trip fails at dispatch time.
+		// Everything else about the prompt is resolved fresh from the API,
+		// not read out of the webhook body.
+		Issue struct {
+			Identifier string `json:"identifier"`
+			URL        string `json:"url"`
+			Team       struct {
+				Key string `json:"key"`
+			} `json:"team"`
+		} `json:"issue"`
 	} `json:"agentSession"`
 	AgentActivity struct {
 		Content struct {
@@ -129,7 +140,7 @@ func (c *client) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if ev.Type != "AgentSessionEvent" || ev.AgentSession.ID == "" {
 		return
 	}
-	go c.dispatch(ev, body)
+	go c.dispatch(ev)
 }
 
 // verify checks the Linear-Signature header: hex(HMAC-SHA256(rawBody, secret)).
@@ -145,7 +156,7 @@ func (c *client) verify(sig string, body []byte) bool {
 
 // dispatch posts the thought ack, then dispatches the Nomad job; on dispatch
 // failure it surfaces an error activity back to the session.
-func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
+func (c *client) dispatch(ev agentSessionEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -162,7 +173,7 @@ func (c *client) dispatch(ev agentSessionEvent, raw []byte) {
 		return
 	}
 
-	if err := c.dispatchNomad(ctx, ev, raw, model, thinking); err != nil {
+	if err := c.dispatchNomad(ctx, ev, model, thinking); err != nil {
 		log.Printf("nomad dispatch failed for session %s: %v", ev.AgentSession.ID, err)
 		msg := fmt.Sprintf("Couldn't start the agent job: %v", err)
 		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
