@@ -10,9 +10,13 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
   activity, and dispatches a parameterized Nomad batch job to run the actual
   agent in isolation. Refreshes its own Linear OAuth access token in place.
   Split by concern: `config.go` (env config), `client.go` (shared client +
-  persisted OAuth state), `linear.go` (Linear GraphQL API + token refresh),
-  `webhook.go` (HTTP handler), `nomad.go` (job dispatch), `payload.go`
-  (shrinking oversized webhook payloads to fit Nomad's dispatch limit).
+  persisted OAuth state), `linear.go` (Linear GraphQL API: activities, token
+  refresh, and resolving a session's trigger comment + thread), `prompt.go`
+  (assembling the system/user prompt from that resolved context, so the
+  dispatch payload carries a finished `{system, prompt}` object instead of
+  the raw webhook — `module/pi-agent.nix`'s entrypoint just writes those two
+  fields out, with no knowledge of Linear's webhook shape), `webhook.go`
+  (HTTP handler), `nomad.go` (job dispatch).
 - **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
   refresh token.
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as
