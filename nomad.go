@@ -38,16 +38,16 @@ func fallbackSessionContext(ev agentSessionEvent) sessionContext {
 // fetched fresh from Linear — see fetchSessionContext), builds the system and
 // user prompt from it, and kicks the parameterized batch job with both as
 // the dispatch payload.
-func (c *client) dispatchNomad(ctx context.Context, ev agentSessionEvent, model, thinking string) error {
+func (c *client) dispatchNomad(ctx context.Context, t *tenant, ev agentSessionEvent, model, thinking string) error {
 	// The receiver is the sole owner of the refresh token; hand the job only a
 	// short-lived access token (no refresh material) so it can post one response
 	// activity without a second refresher rotating tokens out from under us.
-	token, err := c.token(ctx)
+	token, err := t.token(ctx)
 	if err != nil {
 		return fmt.Errorf("get access token for dispatch: %w", err)
 	}
 
-	sc, err := c.fetchSessionContext(ctx, ev.AgentSession.ID, ev.Action)
+	sc, err := t.fetchSessionContext(ctx, ev.AgentSession.ID, ev.Action)
 	if err != nil {
 		log.Printf("session %s: fetch context failed, falling back to a narrower prompt: %v", ev.AgentSession.ID, err)
 		sc = fallbackSessionContext(ev)

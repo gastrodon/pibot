@@ -8,17 +8,18 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 - **`*.go`** (`linear-agent`) — HTTP receiver for Linear's `AgentSessionEvent`
   webhooks. Verifies the HMAC signature, acks the session with a `thought`
   activity, and dispatches a parameterized Nomad batch job to run the actual
-  agent in isolation. Refreshes its own Linear OAuth access token in place.
-  Split by concern: `config.go` (env config), `client.go` (shared client +
-  persisted OAuth state), `linear.go` (Linear GraphQL API: activities, token
-  refresh, and resolving a session's trigger comment + thread), `prompt.go`
-  (assembling the system/user prompt from that resolved context, so the
-  dispatch payload carries a finished `{system, prompt}` object instead of
-  the raw webhook — `module/pi-agent.nix`'s entrypoint just writes those two
-  fields out, with no knowledge of Linear's webhook shape), `webhook.go`
-  (HTTP handler), `nomad.go` (job dispatch).
-- **`mint-token.py`** — one-shot OAuth helper to mint the Linear app's initial
-  refresh token.
+  agent in isolation. Mints and refreshes its own Linear OAuth tokens, one set
+  per installed workspace. Split by concern: `config.go` (env config),
+  `client.go` (shared client + the per-workspace tenants it routes events to),
+  `store.go` (the on-disk token store, one file per workspace), `oauth.go`
+  (the install flow: authorize, callback, exchange, persist), `linear.go`
+  (Linear GraphQL API: activities, token refresh, and resolving a session's
+  trigger comment + thread), `prompt.go` (assembling the system/user prompt
+  from that resolved context, so the dispatch payload carries a finished
+  `{system, prompt}` object instead of the raw webhook —
+  `module/pi-agent.nix`'s entrypoint just writes those two fields out, with no
+  knowledge of Linear's webhook shape), `webhook.go` (HTTP handler),
+  `nomad.go` (job dispatch).
 - **`module/linear-agent.nix`** — NixOS module: builds and runs the receiver as
   a systemd service.
 - **`module/pi-agent.nix`** — NixOS module: the parameterized Nomad job spec
@@ -46,12 +47,66 @@ worker, extracted from [`gastrodon/dotfiles`](https://github.com/gastrodon/dotfi
 ## Secrets
 
 This repo owns **no secrets**. Every module option that needs one is a
-`*File` path (`webhookSecretFile`, `refreshTokenFile`, `clientIdFile`,
-`clientSecretFile`, `nomadTokenFile`, `githubPatFile`,
+`*File` path (`webhookSecretFile`, `clientIdFile`, `clientSecretFile`,
+`nomadTokenFile`, `adminTokenFile`, `githubPatFile`,
 `nomadBootstrapTokenFile`, `authFile`) — `config.go` reads `<KEY>_FILE` in preference to a
 bare `<KEY>` env var. The consuming flake is responsible for decrypting
 secret material and handing over paths, e.g. sops-nix's
 `config.sops.secrets.<name>.path`.
+
+Only *app-level* material is configured that way: the OAuth client
+id/secret and the webhook signing secret, which belong to the one Linear app
+and are the same for every workspace it serves. Per-workspace tokens are never
+configured — they're minted by the install flow below and live in the
+service's state directory.
+
+## Installing into a workspace
+
+The receiver starts with no Linear tokens at all, and is authorized after it's
+deployed rather than before:
+
+1. On the Linear OAuth app, register `${publicUrl}/oauth/callback` as a
+   redirect URI and point the webhook at `${publicUrl}/webhook`.
+2. Read the admin token off the box — the receiver mints one into its state
+   directory on first start and reuses it across restarts:
+   `ssh root@<host> cat /var/lib/linear-agent/admin-token`. (Pin it to your own
+   secret material with `adminTokenFile` if you'd rather.)
+3. Open `${publicUrl}/oauth/start?token=<that>` in a browser and approve. It
+   redirects to Linear with `actor=app` and the agent scopes, catches the
+   callback, exchanges the code, asks Linear which workspace authorized, and
+   files the tokens under it in `/var/lib/linear-agent/tenants/<org-id>.json`.
+
+Re-authorizing is step 3 again — no redeploy, no `sops set`, no restart.
+
+Two gates sit on that flow, because a funnel makes both endpoints publicly
+reachable. `/oauth/start` needs the admin token. `/oauth/callback` only honours
+a `state` this process issued, once, within 10 minutes — and then refuses to
+persist anything unless the workspace Linear names is in
+`allowedOrganizations`. Leave that list empty only if you actually want any
+workspace to be able to install this receiver.
+
+`allowedOrganizations` is re-checked on every inbound event, not only at
+install. The webhook signing secret belongs to the Linear *app*, so any
+workspace that completes consent gets its events delivered here with a valid
+signature — including one whose install was refused, since the code has to be
+exchanged before Linear can be asked who consented. The event path is where
+such a workspace is actually kept out.
+
+The store is keyed per workspace, so one deployment can serve several: an
+inbound event is routed by its `organizationId`, then by `appUserId`. A
+workspace that is named but not held is refused outright — never routed to some
+other install's credentials. The sole install is used as a fallback only for an
+event that genuinely couldn't be matched: no `organizationId`, and either no
+`appUserId` or an install whose app user id was never recorded. Run the install
+flow against `publicUrl` itself — a second box behind the same configuration
+issues states its peer won't recognize.
+
+**Upgrading from the pre-install layout.** A receiver that predates this flow
+kept one workspace's tokens in `/var/lib/linear-agent/token.json`, seeded from
+a `refreshTokenFile`. That file is not migrated — it doesn't record which
+workspace it belongs to — so the upgrade is: deploy, run the install flow, then
+delete `token.json` (it still holds a refresh token). The receiver says as much
+in its log when it finds one and has no installs.
 
 ## Usage
 
@@ -69,8 +124,9 @@ Add this flake as an input and import the modules you need:
         {
           services.linearAgent = {
             enable = true;
+            publicUrl = "https://server1.tailnet.ts.net";
+            allowedOrganizations = [ "<linear workspace id>" ];
             webhookSecretFile = /* ... */;
-            refreshTokenFile = /* ... */;
             clientIdFile = /* ... */;
             clientSecretFile = /* ... */;
             nomadTokenFile = /* ... */;

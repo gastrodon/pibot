@@ -11,15 +11,25 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 // agentSessionEvent is the subset of the Linear webhook we act on.
 type agentSessionEvent struct {
-	Type         string `json:"type"`
-	Action       string `json:"action"`
-	AgentSession struct {
+	Type   string `json:"type"`
+	Action string `json:"action"`
+	// OrganizationID and AppUserID identify the workspace this event came
+	// from, so a receiver serving more than one can route it back to the
+	// right credentials. Both are best-effort: Linear documents
+	// organizationId for data-change events and appUserId as the agent's
+	// per-workspace identity, but neither is promised on every agent session
+	// payload shape — see (*client).tenantFor for what happens when a payload
+	// carries neither.
+	OrganizationID string `json:"organizationId"`
+	AppUserID      string `json:"appUserId"`
+	AgentSession   struct {
 		ID      string `json:"id"`
 		Comment struct {
 			Body string `json:"body"`
@@ -95,17 +105,7 @@ func (c *client) resolveRouting(ev agentSessionEvent) (model, thinking string) {
 
 // modelAllowed reports whether model may be dispatched. An empty allowlist
 // (the default) means validation is off.
-func (c *client) modelAllowed(model string) bool {
-	if len(c.cfg.allowedModels) == 0 {
-		return true
-	}
-	for _, m := range c.cfg.allowedModels {
-		if m == model {
-			return true
-		}
-	}
-	return false
-}
+func (c *client) modelAllowed(model string) bool { return allowed(c.cfg.allowedModels, model) }
 
 func (c *client) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -140,7 +140,32 @@ func (c *client) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if ev.Type != "AgentSessionEvent" || ev.AgentSession.ID == "" {
 		return
 	}
-	go c.dispatch(ev)
+
+	t, err := c.tenantFor(ev.OrganizationID, ev.AppUserID)
+	if err != nil {
+		// Nothing to post the failure back on: replying to a session needs
+		// the very credentials we just failed to find. The payload's own
+		// field names go in the log so the first unroutable event says which
+		// identifiers Linear actually sent, rather than leaving it to guess.
+		log.Printf("session %s: %v (payload fields: %s)", ev.AgentSession.ID, err, topLevelFields(body))
+		return
+	}
+	go c.dispatch(t, ev)
+}
+
+// topLevelFields lists a payload's top-level field names, sorted. Logged only
+// when tenant resolution fails.
+func topLevelFields(body []byte) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return "<unparseable>"
+	}
+	fields := make([]string, 0, len(m))
+	for k := range m {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	return strings.Join(fields, ",")
 }
 
 // verify checks the Linear-Signature header: hex(HMAC-SHA256(rawBody, secret)).
@@ -155,28 +180,29 @@ func (c *client) verify(sig string, body []byte) bool {
 }
 
 // dispatch posts the thought ack, then dispatches the Nomad job; on dispatch
-// failure it surfaces an error activity back to the session.
-func (c *client) dispatch(ev agentSessionEvent) {
+// failure it surfaces an error activity back to the session. Everything it
+// says to Linear goes out as t's workspace.
+func (c *client) dispatch(t *tenant, ev agentSessionEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := c.postActivity(ctx, ev.AgentSession.ID, "thought", "Picking this up — spinning up an agent."); err != nil {
+	if err := t.postActivity(ctx, ev.AgentSession.ID, "thought", "Picking this up — spinning up an agent."); err != nil {
 		log.Printf("thought ack failed for session %s: %v", ev.AgentSession.ID, err)
 	}
 
 	model, thinking := c.resolveRouting(ev)
 	if !c.modelAllowed(model) {
 		msg := fmt.Sprintf("Unknown model %q — not starting an agent. Known models: %s", model, strings.Join(c.cfg.allowedModels, ", "))
-		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
+		if e := t.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
 			log.Printf("error activity failed for session %s: %v", ev.AgentSession.ID, e)
 		}
 		return
 	}
 
-	if err := c.dispatchNomad(ctx, ev, model, thinking); err != nil {
+	if err := c.dispatchNomad(ctx, t, ev, model, thinking); err != nil {
 		log.Printf("nomad dispatch failed for session %s: %v", ev.AgentSession.ID, err)
 		msg := fmt.Sprintf("Couldn't start the agent job: %v", err)
-		if e := c.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
+		if e := t.postActivity(ctx, ev.AgentSession.ID, "error", msg); e != nil {
 			log.Printf("error activity failed for session %s: %v", ev.AgentSession.ID, e)
 		}
 	}
