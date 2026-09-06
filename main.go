@@ -5,14 +5,20 @@
 // activity to acknowledge the session within the 10s budget and (4) dispatches
 // a parameterized Nomad batch job to run the actual agent (pi) in isolation.
 //
-// Linear's OAuth access token is short-lived (~24h), so the receiver refreshes
-// it in place using the refresh token + client credentials and persists the
-// rotated material to STATE_DIR so it survives restarts.
+// The receiver holds no Linear credentials of its own until a workspace is
+// installed into it: /oauth/start → Linear consent → /oauth/callback mints an
+// access + refresh token and files it under that workspace in STATE_DIR. So a
+// box can be deployed first and authorized after. Access tokens are
+// short-lived (~24h), so the receiver refreshes them in place per workspace
+// and persists the rotated material, which is what survives a restart.
 //
 // The receiver's code is split by concern:
 //
 //   - config.go   — env-derived configuration.
-//   - client.go   — the shared client struct and its persisted OAuth state.
+//   - client.go   — the shared client, and the per-workspace tenants it routes
+//     inbound events to.
+//   - store.go    — the on-disk token store: one file per installed workspace.
+//   - oauth.go    — the install flow: authorize, callback, exchange, persist.
 //   - linear.go   — talking to Linear's GraphQL API: activities, token
 //     refresh, and resolving a session's trigger comment + thread.
 //   - prompt.go   — assembling the system/user prompt from a resolved
@@ -30,11 +36,14 @@ import (
 
 func main() {
 	cfg := loadConfig()
-	c := &client{http: &http.Client{Timeout: 10 * time.Second}, cfg: cfg}
-	c.loadToken()
+	c := newClient(cfg)
+	c.loadTenants()
+	c.loadAdminToken()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", c.handleWebhook)
+	mux.HandleFunc(oauthStartPath, c.handleOAuthStart)
+	mux.HandleFunc(oauthCallbackPath, c.handleOAuthCallback)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "ok\n")
 	})

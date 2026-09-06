@@ -18,10 +18,12 @@ const (
 	linearOAuth   = "https://api.linear.app/oauth/token"
 )
 
-// postActivity emits an agent activity (thought | action | response | error),
-// refreshing the OAuth token once on an auth failure and retrying.
-func (c *client) postActivity(ctx context.Context, sessionID, typ, body string) error {
-	token, err := c.token(ctx)
+// postActivity emits an agent activity (thought | action | response | error)
+// into one of this workspace's sessions, refreshing the OAuth token once on an
+// auth failure and retrying.
+func (t *tenant) postActivity(ctx context.Context, sessionID, typ, body string) error {
+	c := t.c
+	token, err := t.token(ctx)
 	if err != nil {
 		return err
 	}
@@ -30,7 +32,7 @@ func (c *client) postActivity(ctx context.Context, sessionID, typ, body string) 
 		return err
 	}
 	if isAuthFailure(status, out) {
-		token, err = c.refreshAfter(ctx, token)
+		token, err = t.refreshAfter(ctx, token)
 		if err != nil {
 			return fmt.Errorf("auth failed and refresh failed: %w", err)
 		}
@@ -202,8 +204,9 @@ func resolveTrigger(action string, top sessionTop) (Trigger, commentRef, error) 
 // fetch failure here should not block dispatch — callers should fall back to
 // a narrower prompt (frontmatter + request, no thread) rather than propagate
 // the error to the Linear thread.
-func (c *client) fetchSessionContext(ctx context.Context, sessionID, action string) (sessionContext, error) {
-	token, err := c.token(ctx)
+func (t *tenant) fetchSessionContext(ctx context.Context, sessionID, action string) (sessionContext, error) {
+	c := t.c
+	token, err := t.token(ctx)
 	if err != nil {
 		return sessionContext{}, fmt.Errorf("get access token: %w", err)
 	}
@@ -253,7 +256,10 @@ func (c *client) fetchSessionContext(ctx context.Context, sessionID, action stri
 // dispatch-time fetch failure degrades to a narrower prompt rather than
 // justifying a second round trip.
 func (c *client) doGraphQL(ctx context.Context, token, query string, variables map[string]any) ([]byte, error) {
-	payload := map[string]any{"query": query, "variables": variables}
+	payload := map[string]any{"query": query}
+	if variables != nil {
+		payload["variables"] = variables
+	}
 	buf, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, linearGraphQL, bytes.NewReader(buf))
 	if err != nil {
@@ -363,85 +369,172 @@ func isAuthFailure(status int, body []byte) bool {
 	return bytes.Contains(bytes.ToLower(body), []byte("authentication"))
 }
 
-// token returns a currently-valid access token, refreshing proactively if it's
-// within 60s of expiry.
-func (c *client) token(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// Refresh when we have no access token at all (bootstrap from the refresh
-	// token alone) or when a known expiry is within 60s.
-	needRefresh := c.tok.AccessToken == "" ||
-		(c.tok.Expires > 0 && time.Now().Unix() >= c.tok.Expires-60)
+// token returns a currently-valid access token for this workspace, refreshing
+// proactively if it's within 60s of expiry.
+func (t *tenant) token(ctx context.Context) (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Refresh when we hold no access token at all (an install whose access
+	// token was already spent) or when a known expiry is within 60s.
+	needRefresh := t.st.AccessToken == "" ||
+		(t.st.Expires > 0 && time.Now().Unix() >= t.st.Expires-60)
 	if needRefresh {
-		if err := c.refreshLocked(ctx); err != nil {
+		if err := t.refreshLocked(ctx); err != nil {
 			return "", err
 		}
 	}
-	if c.tok.AccessToken == "" {
-		return "", fmt.Errorf("no access token available")
+	if t.st.AccessToken == "" {
+		return "", fmt.Errorf("no access token available for workspace %s", t.st.OrgID)
 	}
-	return c.tok.AccessToken, nil
+	return t.st.AccessToken, nil
 }
 
 // refreshAfter refreshes only if the token still matches `used` (i.e. a
 // concurrent caller didn't already refresh), then returns the current token.
-func (c *client) refreshAfter(ctx context.Context, used string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tok.AccessToken == used {
-		if err := c.refreshLocked(ctx); err != nil {
+func (t *tenant) refreshAfter(ctx context.Context, used string) (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.st.AccessToken == used {
+		if err := t.refreshLocked(ctx); err != nil {
 			return "", err
 		}
 	}
-	return c.tok.AccessToken, nil
+	return t.st.AccessToken, nil
 }
 
-// refreshLocked exchanges the refresh token for a new access token and persists
-// the result. Caller must hold c.mu.
-func (c *client) refreshLocked(ctx context.Context) error {
-	if c.cfg.clientID == "" || c.cfg.clientSecret == "" || c.tok.RefreshToken == "" {
-		return fmt.Errorf("cannot refresh: missing client creds or refresh token")
+// refreshLocked exchanges this workspace's refresh token for a new access token
+// and persists the result — Linear may rotate the refresh token on each use, so
+// the rotation has to survive a restart or the install is spent. Caller must
+// hold t.mu.
+func (t *tenant) refreshLocked(ctx context.Context) error {
+	cfg := t.c.cfg
+	if cfg.clientID == "" || cfg.clientSecret == "" || t.st.RefreshToken == "" {
+		return fmt.Errorf("cannot refresh workspace %s: missing client creds or refresh token", t.st.OrgID)
 	}
-	form := url.Values{
+	tok, err := t.c.postOAuth(ctx, url.Values{
 		"grant_type":    {"refresh_token"},
-		"refresh_token": {c.tok.RefreshToken},
-		"client_id":     {c.cfg.clientID},
-		"client_secret": {c.cfg.clientSecret},
+		"refresh_token": {t.st.RefreshToken},
+		"client_id":     {cfg.clientID},
+		"client_secret": {cfg.clientSecret},
+	})
+	if err != nil {
+		return fmt.Errorf("token refresh: %w", err)
 	}
+
+	t.st.AccessToken = tok.AccessToken
+	if tok.RefreshToken != "" { // Linear may rotate the refresh token
+		t.st.RefreshToken = tok.RefreshToken
+	}
+	if tok.ExpiresIn > 0 {
+		t.st.Expires = time.Now().Unix() + tok.ExpiresIn
+	}
+	t.persistLocked()
+	log.Printf("refreshed access token for workspace %s (expires %d)", t.st.OrgID, t.st.Expires)
+	return nil
+}
+
+// tokenResponse is the subset of Linear's /oauth/token reply that both grants
+// this receiver uses — authorization_code at install, refresh_token after —
+// come back with.
+type tokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+}
+
+// postOAuth performs one form-encoded POST to Linear's token endpoint. Shared
+// by the install exchange and the refresh grant, which differ only in the form
+// they send.
+func (c *client) postOAuth(ctx context.Context, form url.Values) (tokenResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, linearOAuth, strings.NewReader(form.Encode()))
 	if err != nil {
-		return err
+		return tokenResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return tokenResponse{}, err
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("token refresh %d: %s", resp.StatusCode, out)
+		return tokenResponse{}, fmt.Errorf("oauth %d: %s", resp.StatusCode, out)
 	}
-	var tr struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
+	var tok tokenResponse
+	if err := json.Unmarshal(out, &tok); err != nil {
+		return tokenResponse{}, fmt.Errorf("decode: %w", err)
 	}
-	if err := json.Unmarshal(out, &tr); err != nil {
-		return fmt.Errorf("token refresh decode: %w", err)
+	if tok.AccessToken == "" {
+		return tokenResponse{}, fmt.Errorf("empty access_token in response")
 	}
-	if tr.AccessToken == "" {
-		return fmt.Errorf("token refresh: empty access_token in response")
+	return tok, nil
+}
+
+// installIdentity is whose a freshly minted token turns out to be: which
+// workspace authorized, and which app user this agent is inside it.
+type installIdentity struct {
+	OrgID     string
+	OrgName   string
+	OrgURLKey string
+	AppUserID string
+}
+
+// organizationQuery and viewerQuery are deliberately two round trips rather
+// than one nested query: the app user id is a nice-to-have (a second key to
+// route webhooks by), while the workspace id is the store's key and must not
+// be lost because the other half of a combined query didn't resolve.
+const (
+	organizationQuery = `query { organization { id name urlKey } }`
+	viewerQuery       = `query { viewer { id } }`
+)
+
+// identify asks Linear who a just-minted token belongs to. The workspace is
+// required — it's what the credentials get filed under. The app user id is
+// best-effort: without it a webhook can still be routed by organizationId.
+func (c *client) identify(ctx context.Context, token string) (installIdentity, error) {
+	out, err := c.doGraphQL(ctx, token, organizationQuery, nil)
+	if err != nil {
+		return installIdentity{}, fmt.Errorf("fetch organization: %w", err)
 	}
-	c.tok.AccessToken = tr.AccessToken
-	if tr.RefreshToken != "" { // Linear may rotate the refresh token
-		c.tok.RefreshToken = tr.RefreshToken
+	var org struct {
+		Data struct {
+			Organization struct {
+				ID     string `json:"id"`
+				Name   string `json:"name"`
+				URLKey string `json:"urlKey"`
+			} `json:"organization"`
+		} `json:"data"`
 	}
-	if tr.ExpiresIn > 0 {
-		c.tok.Expires = time.Now().Unix() + tr.ExpiresIn
+	if err := json.Unmarshal(out, &org); err != nil {
+		return installIdentity{}, fmt.Errorf("decode organization: %w", err)
 	}
-	c.persist(c.tok)
-	log.Printf("refreshed Linear access token (expires %d)", c.tok.Expires)
-	return nil
+	if org.Data.Organization.ID == "" {
+		return installIdentity{}, fmt.Errorf("no organization id in response")
+	}
+
+	id := installIdentity{
+		OrgID:     org.Data.Organization.ID,
+		OrgName:   org.Data.Organization.Name,
+		OrgURLKey: org.Data.Organization.URLKey,
+	}
+
+	out, err = c.doGraphQL(ctx, token, viewerQuery, nil)
+	if err != nil {
+		log.Printf("install %s: no app user id (%v) — webhooks will route by organizationId alone", id.OrgID, err)
+		return id, nil
+	}
+	var viewer struct {
+		Data struct {
+			Viewer struct {
+				ID string `json:"id"`
+			} `json:"viewer"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &viewer); err != nil {
+		log.Printf("install %s: decode viewer: %v", id.OrgID, err)
+		return id, nil
+	}
+	id.AppUserID = viewer.Data.Viewer.ID
+	return id, nil
 }
